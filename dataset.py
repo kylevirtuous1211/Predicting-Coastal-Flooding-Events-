@@ -4,9 +4,7 @@ import os
 class FloodDataset:
     def __init__(self, data_path=None):
         if data_path is None:
-            # Default to relative path
-            # Current file is in root, data in data/
-            self.data_path = os.path.join("data", "processed_data.pkl")
+            self.data_path = "processed_data.pkl"
         else:
             self.data_path = data_path
             

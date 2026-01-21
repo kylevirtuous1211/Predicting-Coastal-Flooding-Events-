@@ -1,1 +1,4 @@
 data/
+*.pkl
+*.zip
+**__pycache__

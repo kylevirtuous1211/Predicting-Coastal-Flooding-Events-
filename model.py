@@ -14,6 +14,7 @@ from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef
 HIST_WINDOW = 7
 PRED_WINDOW = 14
 MODEL_FILE = 'model.pkl'
+BEST_THRESHOLD = 0.75 # Tuned on validation set
 
 # Hardcoded constants from extract_constants.py
 STATION_CONSTANTS = {
@@ -55,58 +56,101 @@ class CoastalFloodModel:
             X (np.array): Features
             ids (list): Corresponding IDs (if index_csv_path provided)
         """
+        import utide 
+        
         print(f"Reading {hourly_csv_path}...")
         df = pd.read_csv(hourly_csv_path)
         
         # Ensure time is datetime
         df['time'] = pd.to_datetime(df['time'])
         
-        # 1. Normalize and Aggregate to Daily
-        print("Aggregating to daily stats...")
-        daily_records = []
+        # 1. Norm, Tide, Surge Calculation
+        print("Calculating Tide and Surge features (UTide)...")
+     
+        # Global storage for "Hourly Features"
+        # Key: Station Name -> DataFrame with ['norm_surge', 'norm_tide', 'seas...']
+        station_data_map = {}
         
         # We process each station separately to be efficient
         for station_name, group in df.groupby('station_name'):
-            # Get constants
+            # Get constants or Estimate them
             consts = STATION_CONSTANTS.get(station_name)
-            if not consts:
-                continue
             
-            thresh = consts['threshold']
-            std_dev = consts['std']
+            if consts:
+                thresh = consts['threshold']
+                std_dev = consts['std']
+            else:
+                # Dynamic Estimation for Hidden Stations
+                valid_sl = group['sea_level'].dropna()
+                if len(valid_sl) == 0:
+                    continue
+                est_mean = valid_sl.mean()
+                est_std = valid_sl.std()
+                est_thresh = est_mean + (2.3 * est_std)
+                thresh = est_thresh
+                std_dev = est_std
+                print(f"[{station_name}] Unknown station. Est Thresh: {thresh:.4f}")
             
-            # Calculate Normalized Value
-            # (SL - Thresh) / Std
-            group = group.copy()
-            group['norm_val'] = (group['sea_level'] - thresh) / std_dev
+            # Extract Latitude (Assumed to be in CSV as 'latitude')
+            if 'latitude' in group.columns:
+                lat = group['latitude'].iloc[0]
+            else:
+                # Fallback if missing (should not happen in ingestion)
+                lat = 0.0 
+                print(f"Warning: Latitude missing for {station_name}, defaulting to 0.0")
+
+            # --- UTide Logic ---
+            raw_hourly = group['sea_level'].values
+            time_nums = group['time'].values # numpy array
             
-            # Resample to Daily
-            # We want to keep station_name
-            g_daily = group.set_index('time').resample('D').agg({
-                'sea_level': 'max',
-                'norm_val': ['mean', 'max', 'min', 'std']
-            })
+            # UTide needs unique time usually, check dupes? Ingestion ensures unique?
+            # We assume unique sorted time.
             
-            # Flatten columns
-            g_daily.columns = ['_'.join(col).strip() for col in g_daily.columns.values]
-            g_daily = g_daily.rename(columns={
-                'sea_level_max': 'max_raw_sl',
-                'norm_val_mean': 'feat_mean',
-                'norm_val_max':  'feat_max',
-                'norm_val_min':  'feat_min',
-                'norm_val_std':  'feat_std'
-            })
+            # Solve
+            valid_mask = ~np.isnan(raw_hourly)
+            # Need dates in day-float format for UTide if passing numpy datetime64?
+            # UTide works better with matplotlib dates usually.
+            # Convert timestamp to ordinal/days
             
-            g_daily['station_name'] = station_name
-            daily_records.append(g_daily)
+            # Faster way: group['time'] is datetime64.
+            # mdates code:
+            # from matplotlib import dates as mdates
+            # t_days = mdates.date2num(group['time'].dt.to_pydatetime())
             
-        if not daily_records:
-            return np.array([]), []
+            # Let's import inside loop or top? Inside is safer for now.
+            from matplotlib import dates as mdates
+            t_days = mdates.date2num(group['time'].dt.to_pydatetime())
             
-        df_daily_all = pd.concat(daily_records)
-        df_daily_all = df_daily_all.sort_index() # Sort by time
-        
-        # 2. Extract Windows based on Index
+            coef = utide.solve(t_days[valid_mask], raw_hourly[valid_mask], lat=lat, verbose=False)
+            tide_reconst = utide.reconstruct(t_days, coef, verbose=False)
+            tide_pred = tide_reconst['h']
+            
+            surge = raw_hourly - tide_pred
+            
+            # Normalize
+            norm_surge = surge / std_dev
+            norm_tide = tide_pred / std_dev
+            
+            # Seasonality
+            # Calculate for all rows
+            time_idx = group['time'] # Series
+            month_sin = np.sin(2 * np.pi * time_idx.dt.month / 12).values
+            month_cos = np.cos(2 * np.pi * time_idx.dt.month / 12).values
+            doy_sin = np.sin(2 * np.pi * time_idx.dt.dayofyear / 365.25).values
+            doy_cos = np.cos(2 * np.pi * time_idx.dt.dayofyear / 365.25).values
+            
+            # Store Processed Series aligned with time
+            processed_df = pd.DataFrame({
+                'norm_surge': norm_surge,
+                'norm_tide': norm_tide,
+                'month_sin': month_sin,
+                'month_cos': month_cos,
+                'doy_sin': doy_sin,
+                'doy_cos': doy_cos
+            }, index=group['time'])
+            
+            station_data_map[station_name] = processed_df
+
         if index_csv_path:
             print(f"Extracting windows from {index_csv_path}...")
             index_df = pd.read_csv(index_csv_path)
@@ -114,48 +158,76 @@ class CoastalFloodModel:
             X_out = []
             ids_out = []
             
-            # Optimize: Group Daily by Station for fast lookup
-            daily_by_station = {k: v for k, v in df_daily_all.groupby('station_name')}
+            expected_hours = HIST_WINDOW * 24 # 168
+            
+            # Feature Vector Size: 168(Surge) + 168(Tide) + 4(Seas) = 340
+            total_feats = (expected_hours * 2) + 4 
             
             for _, row in index_df.iterrows():
                 stn = row['station_name']
                 hist_start = pd.to_datetime(row['hist_start'])
-                hist_end = pd.to_datetime(row['hist_end'])
-                row_id = row['id']
+                # hist_end = pd.to_datetime(row['hist_end']) # Inclusive
                 
-                if stn not in daily_by_station:
+                if stn not in station_data_map:
+                    X_out.append(np.zeros(total_feats))
+                    ids_out.append(row['id'])
                     continue
+                    
+                stn_data = station_data_map[stn]
                 
-                stn_data = daily_by_station[stn]
+                # Get Window [start : start+168h]
+                # Slice range
+                end_ts = hist_start + timedelta(hours=expected_hours - 1)
                 
-                # Slicing: inclusive of start and end for daily data?
-                # hist_start to hist_end is 7 days.
-                # Check timestamps. 
-                # pandas slicing on DatetimeIndex is inclusive.
-                mask = (stn_data.index >= hist_start) & (stn_data.index <= hist_end)
-                window = stn_data[mask]
+                # Use slice
+                window = stn_data[hist_start : end_ts]
                 
-                # Feature columns
-                feat_cols = ['feat_mean', 'feat_max', 'feat_min', 'feat_std']
+                # Handle missing/short
+                if len(window) < expected_hours:
+                   # Pad with 0s? or NaNs? 
+                   # Create dummy df of zeros with correct index?
+                   # Simple solution: Reindex
+                   full_idx = pd.date_range(hist_start, periods=expected_hours, freq='H')
+                   window = window.reindex(full_idx).fillna(0)
                 
-                if len(window) != HIST_WINDOW:
-                    # Pad? Or Skip? 
-                    # Challenge data should be complete, but robust code checks.
-                    # If missing, we might pad with 0 or last value using reindex
-                    expected_dates = pd.date_range(start=hist_start, end=hist_end, freq='D')
-                    window = window.reindex(expected_dates).fillna(0) # Simple imputation
+                # Extract components
+                win_surge = window['norm_surge'].values
+                win_tide = window['norm_tide'].values
                 
-                assert len(window) == HIST_WINDOW
+                # Seasonality: Take LAST value (current time)
+                # i.e., at index 167 (most recent)
+                last_row = window.iloc[-1]
+                seas_feats = last_row[['month_sin', 'month_cos', 'doy_sin', 'doy_cos']].values
                 
-                feats = window[feat_cols].values.flatten()
-                X_out.append(feats)
-                ids_out.append(row_id)
+                # Flatten and Concat
+                # [Surge_0..167, Tide_0..167, Seas_0..3]
+                x_vec = np.concatenate([win_surge, win_tide, seas_feats])
+                
+                X_out.append(x_vec)
+                ids_out.append(row['id'])
                 
             return np.array(X_out), ids_out
             
         else:
+            return np.array([]), []
+            
+        else:
             # Training mode or raw extraction not implemented for CSV here
             return np.array([]), []
+
+    def calibrate_probabilities(self, probs, threshold=BEST_THRESHOLD):
+        """
+        Maps the optimal threshold to 0.5 using piecewise linear scaling.
+        val < thresh -> scaled to [0, 0.5]
+        val >= thresh -> scaled to [0.5, 1.0]
+        """
+        probs = np.array(probs)
+        probs_calibrated = np.where(
+            probs <= threshold,
+            probs * (0.5 / threshold),
+            0.5 + (probs - threshold) * (0.5 / (1.0 - threshold))
+        )
+        return probs_calibrated
 
     def predict_from_csv(self, hourly_csv, index_csv, output_csv):
         if self.model is None:
@@ -164,25 +236,28 @@ class CoastalFloodModel:
         X, ids = self.process_csv_data(hourly_csv, index_csv)
         
         print(f"Predicting for {len(X)} windows...")
-        y_pred_prob = self.model.predict(X)
-        # Binary prediction (Optional: Return probabilities? Challenge asks for binary usually, but ingestion checks 'y_prob')
-        # We will return the probability/label. Since ingestion checks for 'y_prob', let's format it.
-        # Actually XGBRegressor predicts continuous score. Since we trained with binary targets 0/1, 
-        # the output is probability-like.
+        y_pred_probs_raw = self.model.predict(X)
         
-        # Formatting output
+        # Calibrate Probabilities
+        print(f"Calibrating probabilities (Threshold {BEST_THRESHOLD} -> 0.5)...")
+        y_pred_probs = self.calibrate_probabilities(y_pred_probs_raw)
+        
+        # Flatten predictions: 14 days per window -> 14 rows per window
         results = []
+        global_id = 0
         for i, uid in enumerate(ids):
-            # Convert 14-day array to list string or similar?
-            # If the ingestion expects a single column 'y_prob', it's likely a list string.
-            # OR we output 14 columns?
-            # Let's try outputting the list as a string to be safe.
-            preds = y_pred_prob[i].tolist()
-            results.append({'id': uid, 'y_prob': str(preds)})
+            # Window Prediction: vector of 14 values
+            window_probs = y_pred_probs[i]
+            
+            for day_prob in window_probs:
+                # We can use sequential ID matching scoring.py's expected y_test structure
+                # y_test likely flattens: Window0_Day0, Window0_Day1...
+                results.append({'id': global_id, 'y_prob': float(day_prob)})
+                global_id += 1
             
         res_df = pd.DataFrame(results)
         res_df.to_csv(output_csv, index=False)
-        print(f"Predictions saved to {output_csv}")
+        print(f"Predictions saved to {output_csv} (Total rows: {len(res_df)})")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

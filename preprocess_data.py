@@ -37,8 +37,9 @@ def preprocess_data():
     station_names = [s[0] for s in data_mat['sname'].flatten()] 
     time = data_mat['t'].flatten()
     time_dt = pd.to_datetime([matlab2datetime(t) for t in time])
-    
-    # Extract Thresholds
+    latitudes = data_mat['lattg'].flatten() # Needed for UTide
+
+    # ... (Threshold extraction same as before) ...
     t_names = [s[0] for s in thresh_mat['sname'].flatten()]
     t_vals = thresh_mat['thminor_stnd'].flatten()
     threshold_map = dict(zip(t_names, t_vals))
@@ -49,86 +50,130 @@ def preprocess_data():
     X_train, y_train = [], []
     X_val, y_val = [], []
     
+    import utide # Import here or top level
+
     for i, name in enumerate(station_names):
         print(f"  Processing {name}...")
         thresh = threshold_map.get(name)
+        lat = latitudes[i]
         
         # Get raw hourly data
         raw_hourly = sea_level[:, i]
         
-        # Calculate Station Stats (using entire history for climatology)
-        valid_data = raw_hourly[~np.isnan(raw_hourly)]
+        # Calculate Station Stats
+        valid_mask = ~np.isnan(raw_hourly)
+        valid_data = raw_hourly[valid_mask]
         station_std = np.std(valid_data)
+        
+        # UTide: Solve for constituents
+        # We use the time in matplotlib date format or similar? 
+        # utide expects time in days usually (datenum). 'time' variable is already Matlab datenum.
+        
+        print(f"    - Computing Astronomical Tide (UTide)...")
+        coef = utide.solve(time[valid_mask], valid_data, lat=lat, verbose=False)
+        
+        # Reconstruct for entire timeline (including missing values)
+        tide_reconst = utide.reconstruct(time, coef, verbose=False)
+        tide_pred = tide_reconst['h']
         
         # Create DataFrame
         df = pd.DataFrame({
             'time': time_dt,
-            'sea_level': raw_hourly
+            'sea_level': raw_hourly,
+            'tide_pred': tide_pred
         })
         
-        # 1. Feature Engineering: Standardized Distance
-        # feature = (sea_level - threshold) / station_std
+        # 1. Feature Engineering
+        # A. Standardized Distance
         df['norm_val'] = (df['sea_level'] - thresh) / station_std
         
-        # 2. Aggregating to Daily
-        df_daily = df.set_index('time').resample('D').agg({
-            'sea_level': 'max',  # Max raw level for checking flood
-            'norm_val': ['mean', 'max', 'min', 'std'] # Features
-        })
+        # B. Surge (Residual)
+        # The key physics-based feature
+        df['surge'] = df['sea_level'] - df['tide_pred']
         
-        # Flatten MultiIndex columns
-        df_daily.columns = ['_'.join(col).strip() for col in df_daily.columns.values]
+        # Normalize tide and surge too? 
+        # XGBoost handles scale well, but normalizing helps convergence usually.
+        # Let's keep them raw or normalize by station_std.
+        df['norm_tide'] = df['tide_pred'] / station_std
+        df['norm_surge'] = df['surge'] / station_std
         
-        # Rename for clarity
-        df_daily = df_daily.rename(columns={
-            'sea_level_max': 'max_raw_sl',
-            'norm_val_mean': 'feat_mean',
-            'norm_val_max':  'feat_max',
-            'norm_val_min':  'feat_min',
-            'norm_val_std':  'feat_std'
-        })
+        # C. Keep Seasonality? User said UTide replaces it, but Month/Day might capture thermal expansion not in tides.
+        # Let's keep them.
+        df['month_sin'] = np.sin(2 * np.pi * df['time'].dt.month / 12)
+        df['month_cos'] = np.cos(2 * np.pi * df['time'].dt.month / 12)
+        df['doy_sin'] = np.sin(2 * np.pi * df['time'].dt.dayofyear / 365.25)
+        df['doy_cos'] = np.cos(2 * np.pi * df['time'].dt.dayofyear / 365.25)
+
+        # Data Arrays
+        # We need continuous arrays to slice windows
+        # Using Normalized Surge and Tide as primary features
+        norm_surge = df['norm_surge'].values
+        norm_tide = df['norm_tide'].values
         
-        # 3. Create Binary Target
-        # Flood = 1 if max_raw_sl > threshold
-        df_daily['target'] = (df_daily['max_raw_sl'] > thresh).astype(int)
+        # Seasonality (we only need it for the 'current' prediction time, i.e., end of input window)
+        # Or maybe the middle? End is best (t=0 relative to prediction)
+        month_sin = df['month_sin'].values
+        month_cos = df['month_cos'].values
+        doy_sin = df['doy_sin'].values
+        doy_cos = df['doy_cos'].values
         
-        # Drop NaNs (days with missing data)
-        df_daily = df_daily.dropna()
+        raw_values = df['sea_level'].values
         
-        # 4. Create Sliding Windows
-        # Input: 7 days of features
-        # Output: 14 days of targets
-        
-        feature_cols = ['feat_mean', 'feat_max', 'feat_min', 'feat_std']
-        data_values = df_daily[feature_cols].values
-        target_values = df_daily['target'].values
-        
-        num_samples = len(df_daily) - HIST_WINDOW - PRED_WINDOW
+        num_hours = len(df)
+        hours_per_window = HIST_WINDOW * 24 # 168
+        hours_per_pred = PRED_WINDOW * 24   # 336
         
         station_X = []
         station_y = []
         
-        if num_samples > 0:
-            for t in range(0, num_samples, 1):
-                # Input: [t : t+7]
-                x_window = data_values[t : t+HIST_WINDOW].flatten()
-                # Target: [t+7 : t+7+14]
-                y_window = target_values[t+HIST_WINDOW : t+HIST_WINDOW+PRED_WINDOW]
-                
-                station_X.append(x_window)
-                station_y.append(y_window)
+        # Slide by 24 hours (1 Day)
+        # Range: Stop early enough to have full input AND full prediction
+        # Input: [t : t+168]
+        # Target: [t+168 : t+168+336]
         
-        # 5. Assign to Train or Val depending on station name
+        for t in range(0, num_hours - hours_per_window - hours_per_pred + 1, 24):
+            # Input Window Indices: t to t+168
+            # The 'current time' (predictions start) is at t+168
+            
+            # 1. Hourly Features (168 * 2 = 336 features)
+            win_surge = norm_surge[t : t + hours_per_window]
+            win_tide = norm_tide[t : t + hours_per_window]
+            
+            # Check for NaNs
+            if np.isnan(win_surge).sum() > 24: 
+                continue # Too many missing values
+            win_surge = np.nan_to_num(win_surge)
+            win_tide = np.nan_to_num(win_tide)
+            
+            # 2. Seasonality (Static for the window - take the last step i.e. "Now")
+            idx_now = t + hours_per_window - 1
+            seas_feats = np.array([
+                month_sin[idx_now], month_cos[idx_now],
+                doy_sin[idx_now], doy_cos[idx_now]
+            ])
+            
+            # flatten and concat
+            # [Surge_0...Surge_167, Tide_0...Tide_167, M_sin, M_cos, D_sin, D_cos]
+            x_vec = np.concatenate([win_surge, win_tide, seas_feats])
+            
+            # Target
+            y_window_raw = raw_values[t + hours_per_window : t + hours_per_window + hours_per_pred]
+            y_days = y_window_raw.reshape(PRED_WINDOW, 24)
+            y_daily_max = np.nanmax(y_days, axis=1)
+            y_labels = (y_daily_max > thresh).astype(int)
+            
+            station_X.append(x_vec)
+            station_y.append(y_labels)
+
+        # 5. Assign
         if name in TRAINING_STATIONS:
             X_train.extend(station_X)
             y_train.extend(station_y)
         elif name in TESTING_STATIONS:
             X_val.extend(station_X)
             y_val.extend(station_y)
-        else:
-            print(f"Warning: Station {name} not in Train or Test lists. Skipping.")
-
-    # Convert to arrays
+            
+    # Save
     X_train = np.array(X_train)
     y_train = np.array(y_train)
     X_val = np.array(X_val)
@@ -138,12 +183,17 @@ def preprocess_data():
     print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
     print(f"X_val shape: {X_val.shape}, y_val shape: {y_val.shape}")
     
-    # Save
+    # Feature Names logic:
+    # 168 surge + 168 tide + 4 seas
+    fnames = [f'surge_h{i}' for i in range(168)] + \
+             [f'tide_h{i}' for i in range(168)] + \
+             ['month_sin', 'month_cos', 'doy_sin', 'doy_cos']
+
     with open(OUTPUT_FILE, 'wb') as f:
         pickle.dump({
             'X_train': X_train, 'y_train': y_train,
             'X_val': X_val, 'y_val': y_val,
-            'feature_names': feature_cols
+            'feature_names': fnames
         }, f)
     print(f"Saved processed data to {OUTPUT_FILE}")
 
