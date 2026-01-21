@@ -5,6 +5,7 @@ import numpy as np
 import os
 import sys
 from sklearn.metrics import confusion_matrix, matthews_corrcoef
+from tqdm import tqdm
 
 # Add Time-RCD to path (priority)
 sys.path.insert(0, os.path.join(os.getcwd(), "Time-RCD"))
@@ -66,7 +67,7 @@ def test():
     
     print("Starting Inference...")
     with torch.no_grad():
-        for batch in test_loader:
+        for batch in tqdm(test_loader, desc="Evaluating"):
             time_series = batch['time_series'].to(device)
             mask = batch['mask'].to(device)
             thresholds = batch['threshold'].numpy()
