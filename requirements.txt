@@ -1,0 +1,8 @@
+pandas
+numpy
+scipy
+xgboost>=1.6.0
+scikit-learn
+utide
+scikit-learn
+matplotlib

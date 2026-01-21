@@ -1,0 +1,13 @@
+name: flood_challenge
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - pip:
+    - pandas
+    - numpy
+    - scipy
+    - xgboost
+    - scikit-learn
+    - matplotlib
