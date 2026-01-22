@@ -16,9 +16,9 @@ from models.time_rcd.time_rcd_config import TimeRCDConfig
 
 # Configuration
 DATA_FILE = "foundation_data.pkl"
-# CHECKPOINT_PATH = "checkpoints/timercd_finetune/timercd_epoch_1.pth" # Or best
-# Zero-shot evaluation using pretrained model:
-CHECKPOINT_PATH = "Time-RCD/checkpoints/full_mask_anomaly_head_pretrain_checkpoint_best.pth"
+# CHECKPOINT_PATH = "Time-RCD/checkpoints/full_mask_anomaly_head_pretrain_checkpoint_best.pth"
+# Finetuned Checkpoint (Epoch 1)
+CHECKPOINT_PATH = "checkpoints/timercd_finetune/timercd_epoch_1.pth"
 
 BATCH_SIZE = 32
 

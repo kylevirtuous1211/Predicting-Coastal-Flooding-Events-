@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 import os
 import sys
+from tqdm import tqdm
 
 # Add Time-RCD to path (priority)
 sys.path.insert(0, os.path.join(os.getcwd(), "Time-RCD"))
@@ -90,7 +91,7 @@ def train():
     
     for epoch in range(EPOCHS):
         total_loss = 0
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")):
             # Batch: {'time_series': (B, 504, 1), 'mask': (B, 504), 'threshold': ...}
             
             time_series = batch['time_series'].to(device) # (B, 504, 1)
