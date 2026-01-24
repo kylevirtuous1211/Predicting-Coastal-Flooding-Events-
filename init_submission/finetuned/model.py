@@ -7,15 +7,11 @@ import numpy as np
 import os
 import pickle
 import math
-import sys
 import argparse
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, field
-from einops import rearrange
-from jaxtyping import Float, Int
 from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, matthews_corrcoef
-import scipy.io
 import pandas as pd
 from datetime import datetime, timedelta
 
@@ -82,7 +78,8 @@ class RotaryEmbedding(nn.Module):
         return freqs
 
 class BinaryAttentionBias(nn.Module):
-    def __init__(self, num_heads: Int):
+    # Change type hint: Int -> int
+    def __init__(self, num_heads: int): 
         super().__init__()
         self.num_heads = num_heads
         self.emd = nn.Embedding(2, num_heads)
@@ -90,7 +87,13 @@ class BinaryAttentionBias(nn.Module):
     def forward(self, query_id, kv_id):
         ind = torch.eq(query_id.unsqueeze(-1), kv_id.unsqueeze(-2))
         ind = ind.unsqueeze(1)
-        weight = rearrange(self.emd.weight, "two num_heads -> two num_heads 1 1")
+        
+        # OLD: weight = rearrange(self.emd.weight, "two num_heads -> two num_heads 1 1")
+        # NEW: Standard PyTorch reshaping
+        # self.emd.weight has shape [2, num_heads]
+        # We add two singleton dimensions at the end to make it [2, num_heads, 1, 1]
+        weight = self.emd.weight.unsqueeze(-1).unsqueeze(-1)
+        
         bias = ~ind * weight[:1] + ind * weight[1:]
         return bias
 
