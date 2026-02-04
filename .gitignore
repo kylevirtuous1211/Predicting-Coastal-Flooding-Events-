@@ -6,3 +6,5 @@ Time-RCD/checkpoints/
 __pycache__/
 *.pkl
 checkpoints/
+*.csv
+init_submission/*
