@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 import os
 import sys
+import argparse
 from sklearn.metrics import confusion_matrix, matthews_corrcoef
 from tqdm import tqdm
 
@@ -14,17 +15,36 @@ from timercd_utils import FloodDataset
 from models.time_rcd.TimeRCD_pretrain_multi import TimeSeriesPretrainModel
 from models.time_rcd.time_rcd_config import TimeRCDConfig
 
+# Import Prior Token model (optional)
+try:
+    from model_prior_token import TimeRCDWithPrior, TimeRCDConfig as PriorConfig
+    PRIOR_AVAILABLE = True
+except ImportError:
+    PRIOR_AVAILABLE = False
+
 # Configuration
 DATA_FILE = "foundation_data.pkl"
 # CHECKPOINT_PATH = "Time-RCD/checkpoints/full_mask_anomaly_head_pretrain_checkpoint_best.pth"
 # Finetuned Checkpoint (Epoch 1)
 CHECKPOINT_PATH = "checkpoints/timercd_finetune/timercd_epoch_19.pth"
+PRIOR_CHECKPOINT_PATH = "checkpoints/timercd_prior/timercd_prior_best.pth"
+SCOUT_CHECKPOINT_PATH = "scout.pkl"
 
 BATCH_SIZE = 32
 
 from sklearn.metrics import confusion_matrix, matthews_corrcoef, f1_score
 
-def test(model=None, device=None, split='test'):
+def test(model=None, device=None, split='test', use_prior=False, checkpoint_path=None):
+    """
+    Test TimeRCD model with optional Prior Token support.
+    
+    Args:
+        model: Pre-initialized model (optional)
+        device: Torch device
+        split: 'train' or 'test'
+        use_prior: If True, use TimeRCDWithPrior model
+        checkpoint_path: Override default checkpoint path
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
@@ -34,20 +54,34 @@ def test(model=None, device=None, split='test'):
     test_dataset = FloodDataset(DATA_FILE, split=split)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
+    # Determine checkpoint path
+    if checkpoint_path is None:
+        checkpoint_path = PRIOR_CHECKPOINT_PATH if use_prior else CHECKPOINT_PATH
+    
     # Initialize Model if not provided
     if model is None:
-        print("Initializing TimeRCD...")
-        config = TimeRCDConfig()
-        config.ts_config.num_features = 1
-        config.ts_config.d_model = 512
-        config.ts_config.patch_size = 16
-        
-        model = TimeSeriesPretrainModel(config).to(device)
+        if use_prior and PRIOR_AVAILABLE:
+            print("Initializing TimeRCDWithPrior...")
+            config = PriorConfig()
+            config.ts_config.num_features = 1
+            config.ts_config.d_model = 512
+            config.ts_config.patch_size = 16
+            
+            model = TimeRCDWithPrior(config, scout_checkpoint=SCOUT_CHECKPOINT_PATH).to(device)
+            model.freeze_scout()
+        else:
+            print("Initializing TimeRCD...")
+            config = TimeRCDConfig()
+            config.ts_config.num_features = 1
+            config.ts_config.d_model = 512
+            config.ts_config.patch_size = 16
+            
+            model = TimeSeriesPretrainModel(config).to(device)
         
         # Load Weights
-        if os.path.exists(CHECKPOINT_PATH):
-            print(f"Loading weights from {CHECKPOINT_PATH}")
-            state_dict = torch.load(CHECKPOINT_PATH, map_location=device)
+        if os.path.exists(checkpoint_path):
+            print(f"Loading weights from {checkpoint_path}")
+            state_dict = torch.load(checkpoint_path, map_location=device)
             if 'model_state_dict' in state_dict:
                  state_dict = state_dict['model_state_dict']
             
@@ -61,7 +95,7 @@ def test(model=None, device=None, split='test'):
                     
             model.load_state_dict(new_state_dict, strict=False) 
         else:
-            print(f"Checkpoint {CHECKPOINT_PATH} not found!")
+            print(f"Checkpoint {checkpoint_path} not found!")
             return {}
 
     model.eval()
@@ -161,4 +195,10 @@ def test(model=None, device=None, split='test'):
     return {'mcc': best_mcc, 'f1': best_f1, 'cm': cm, 'best_thresh': best_thresh}
 
 if __name__ == "__main__":
-    test()
+    parser = argparse.ArgumentParser(description="Test TimeRCD model with optional Prior Token support")
+    parser.add_argument("--use_prior", action="store_true", help="Use TimeRCDWithPrior model")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Override checkpoint path")
+    parser.add_argument("--split", type=str, default="test", choices=["train", "test"], help="Dataset split")
+    args = parser.parse_args()
+    
+    test(use_prior=args.use_prior, checkpoint_path=args.checkpoint, split=args.split)

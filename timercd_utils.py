@@ -141,9 +141,14 @@ class FloodDataset(Dataset):
         
         threshold = item['threshold']
         
+        # Flood label: did ANY hour in the future exceed threshold (normalized value > 0)?
+        flood_label = int((Y > 0).any())
+        
         return {
             'time_series': full_seq,   # (504, 1)
             'mask': mask,              # (504,)
             'threshold': threshold,
-            'station_name': item['name']
+            'station_name': item['name'],
+            'flood_label': flood_label  # NEW: for FloodScout training
         }
+
