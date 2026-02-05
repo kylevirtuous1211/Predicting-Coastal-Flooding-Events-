@@ -29,7 +29,7 @@ cp analysis_plots/station_thresholds_geo.csv init_submission/geo/analysis_plots/
 cp Time-RCD/checkpoints/full_mask_anomaly_head_pretrain_checkpoint_best.pth init_submission/zeroshot/model.pkl
 
 # Finetuned Model
-cp checkpoints/timercd_finetune/timercd_epoch_1.pth init_submission/finetuned/model.pkl
+cp checkpoints/timercd_finetune/timercd_epoch_19.pth init_submission/finetuned/model.pkl
 
 # Geo Model (best: epoch 2)
 cp checkpoints/timercd_geo/geo_epoch_2.pth init_submission/geo/model.pkl
@@ -40,7 +40,5 @@ cd init_submission/zeroshot
 zip -r ../../zeroshot.zip .
 cd ../finetuned
 zip -r ../../finetuned.zip .
-cd ../geo
-zip -r ../../geo.zip .
 
 echo "Submission files created: zeroshot.zip, finetuned.zip, and geo.zip"

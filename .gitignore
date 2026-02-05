@@ -1,10 +1,12 @@
 data/
 *.pkl
 *.zip
+*.png
+*.csv
+*.pkl
 **__pycache__foundation_data.pkl
 Time-RCD/checkpoints/
 __pycache__/
-*.pkl
 checkpoints/
-*.csv
 init_submission/*
+archive/

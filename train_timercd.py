@@ -7,8 +7,12 @@ import os
 import sys
 from tqdm import tqdm
 
+import matplotlib.pyplot as plt
+
 # Add Time-RCD to path (priority)
 sys.path.insert(0, os.path.join(os.getcwd(), "Time-RCD"))
+
+from test_timercd import test
 
 from timercd_utils import FloodDataset
 from models.time_rcd.TimeRCD_pretrain_multi import TimeSeriesPretrainModel
@@ -19,9 +23,35 @@ DATA_FILE = "foundation_data.pkl"
 CHECKPOINT_DIR = "checkpoints/timercd_finetune"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-BATCH_SIZE = 32
+BATCH_SIZE = 256
 EPOCHS = 20
 LEARNING_RATE = 1e-4
+
+def weighted_reconstruction_loss(embeddings, targets, mask, model, flood_weight=10.0):
+    """
+    Custom Loss that penalizes errors on FLOOD values much harder than normal values.
+    """
+    # 1. Get the model's prediction (Reconstruction)
+    # The model outputs embeddings, we need to project them back to values
+    predictions = model.reconstruction_head(embeddings) 
+    # 2. Reshape to match targets (B, 504, 3, 1) -> (B, 504, 3)
+    predictions = predictions.view(targets.shape)
+    # 3. Calculate Squared Error (MSE)
+    # targets is the Ground Truth (time_series)
+    loss = (predictions - targets) ** 2
+    # 4. Create the Weight Map
+    # Default weight = 1.0
+    weights = torch.ones_like(loss)
+    flood_indices = targets[:, :, 0] > 0.0 
+    # Apply the penalty weight to the Sea Level channel (Channel 0) at those times
+    weights[:, :, 0][flood_indices] = flood_weight
+    # 5. Apply the Mask (Only train on the Future/Masked part)
+    # mask is 1 for future, 0 for history
+    # We multiply by mask to ignore history errors
+    mask_expanded = mask.unsqueeze(-1).expand_as(loss) # (B, 504, 3)
+    final_loss = (loss * weights * mask_expanded).mean()
+
+    return final_loss
 
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -89,6 +119,12 @@ def train():
     print("Starting Training...")
     model.train()
     
+    train_losses = []
+    val_mccs = []
+    val_f1s = []
+    
+    os.makedirs("training_plots", exist_ok=True)
+    
     for epoch in range(EPOCHS):
         total_loss = 0
         for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")):
@@ -101,16 +137,21 @@ def train():
             # Shape: (B, 504)
             attention_mask = torch.ones((time_series.size(0), time_series.size(1)), dtype=torch.bool).to(device)
             
+            # CRITICAL FIX: Zero out the Future in Training too!
+            # Otherwise we are training an Autoencoder (Copy task), not a Forecaster.
+            train_input = time_series.clone()
+            train_input[mask.bool()] = 0.0
+            
             optimizer.zero_grad()
             
             # Forward Pass
             # TimeSeriesPretrainModel (from TimeRCD_pretrain_multi.py) forward returns embeddings
             # We must pass attention_mask as the second argument
-            embeddings = model(time_series, attention_mask) 
+            embeddings = model(train_input, attention_mask) 
             
             # Calculate Loss
             # We want to reconstruct the MASKED part (The Future)
-            loss = model.masked_reconstruction_loss(embeddings, time_series, mask)
+            loss = weighted_reconstruction_loss(embeddings, time_series, mask, model, flood_weight=5.0)
             
             loss.backward()
             optimizer.step()
@@ -120,8 +161,40 @@ def train():
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {avg_loss:.6f}")
         
+        train_losses.append(avg_loss)
+        
         # Save Checkpoint
         torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"timercd_epoch_{epoch+1}.pth"))
+        
+        # Validation
+        print(f"Running Validation for Epoch {epoch+1}...")
+        metrics = test(model=model, device=device, split='test')
+        val_mccs.append(metrics['mcc'])
+        val_f1s.append(metrics['f1'])
+        
+        model.train() # Switch back to train mode
+        
+        # Plotting
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(1, epoch+2), train_losses, label='Training Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('MSE Loss')
+        plt.title('Training Loss Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("training_plots/loss.png")
+        plt.close()
+        
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(1, epoch+2), val_mccs, label='MCC')
+        plt.plot(range(1, epoch+2), val_f1s, label='F1 Score')
+        plt.xlabel('Epoch')
+        plt.ylabel('Score')
+        plt.title('Validation Metrics Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("training_plots/metrics.png")
+        plt.close()
         
     print("Training Complete.")
 
