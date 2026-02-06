@@ -10,3 +10,5 @@ __pycache__/
 checkpoints/
 init_submission/*
 archive/
+submission_prior/
+submission_scout/
