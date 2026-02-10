@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 class TimeSeriesConfig:
     d_model: int = 512
     d_proj: int = 256
-    patch_size: int = 4
+    patch_size: int = 21  # Optimal resolution for flood prediction
     num_query_tokens: int = 1
     num_layers: int = 8
     num_heads: int = 8
@@ -243,14 +243,15 @@ class TimeSeriesEncoder(nn.Module):
             elif 'bias' in name:
                 nn.init.constant_(param, 0.0)
 
-    def forward(self, time_series, mask, prior_token=None):
+    def forward(self, time_series, mask, film_params=None):
         """
-        Forward pass with optional prior token injection.
+        Forward pass with optional FiLM conditioning.
         
         Args:
             time_series: (B, seq_len, num_features)
             mask: (B, seq_len) attention mask
-            prior_token: Optional (B, 1, d_model) prior token to prepend
+            film_params: Optional tuple (gamma, beta) each of shape (B, 1, d_model)
+                         for FiLM conditioning: output = gamma * embedding + beta
         """
         if time_series.dim() == 2: time_series = time_series.unsqueeze(-1)
         device = time_series.device
@@ -269,20 +270,14 @@ class TimeSeriesEncoder(nn.Module):
         feature_id = torch.arange(num_features, device=device).repeat_interleave(num_patches).unsqueeze(0).expand(B, -1)
         embedded_patches = self.embedding_layer(patches)
 
+        # Apply FiLM conditioning if provided: output = gamma * input + beta
+        if film_params is not None:
+            gamma, beta = film_params  # Each: (B, 1, d_model)
+            embedded_patches = gamma * embedded_patches + beta
+
         mask_view = mask.view(B, num_patches, self.patch_size)
         patch_mask = mask_view.sum(dim=-1) > 0
         full_mask = patch_mask.unsqueeze(1).expand(-1, num_features, -1).reshape(B, num_features * num_patches)
-
-        # Inject prior token if provided
-        if prior_token is not None:
-            # Prepend prior token to embedded patches
-            embedded_patches = torch.cat([prior_token, embedded_patches], dim=1)
-            # Extend mask and feature_id for prior token
-            prior_mask = torch.ones(B, 1, dtype=torch.bool, device=device)
-            full_mask = torch.cat([prior_mask, full_mask], dim=1)
-            prior_feature_id = torch.zeros(B, 1, dtype=feature_id.dtype, device=device)
-            feature_id = torch.cat([prior_feature_id, feature_id], dim=1)
-            total_length += 1
 
         freqs = self.rope_embedder(total_length).to(device) if self.use_rope else None
         
@@ -290,10 +285,6 @@ class TimeSeriesEncoder(nn.Module):
             output = self.transformer_encoder(embedded_patches, freqs=freqs, src_id=feature_id, attn_mask=full_mask)
         else:
             output = self.transformer_encoder(embedded_patches, freqs=freqs, attn_mask=full_mask)
-
-        # Remove prior token from output if it was added
-        if prior_token is not None:
-            output = output[:, 1:, :]
 
         patch_embeddings = output
         patch_proj = self.projection_layer(patch_embeddings)
@@ -326,8 +317,8 @@ class TimeSeriesPretrainModel(nn.Module):
             nn.Linear(ts_config.d_proj // 2, 2)
         )
 
-    def forward(self, time_series: torch.Tensor, mask: Optional[torch.Tensor] = None, prior_token: Optional[torch.Tensor] = None):
-        return self.ts_encoder(time_series, mask, prior_token=prior_token)
+    def forward(self, time_series: torch.Tensor, mask: Optional[torch.Tensor] = None, film_params: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+        return self.ts_encoder(time_series, mask, film_params=film_params)
 
     def masked_reconstruction_loss(self, local_embeddings, original_time_series, mask):
         batch_size, seq_len, num_features = original_time_series.shape
@@ -349,7 +340,6 @@ class TimeSeriesPretrainModel(nn.Module):
         else:
             return torch.tensor(0.0, device=logits.device)
 
-
 # ==========================================
 # 4. Prior Token Modules (NEW)
 # ==========================================
@@ -364,7 +354,7 @@ class FloodScout(nn.Module):
     Input: (B, context_len, 1) - e.g., (B, 168, 1) for 7-day history
     Output: (B, 1) - flood probability in [0, 1]
     """
-    def __init__(self, input_len: int = 168, hidden_dim: int = 64):
+    def __init__(self, input_len: int = 336, hidden_dim: int = 64):
         super().__init__()
         self.input_len = input_len
         
@@ -412,34 +402,55 @@ class FloodScout(nn.Module):
         return prob
 
 
-class PriorEmbedding(nn.Module):
+class FiLMPriorEmbedding(nn.Module):
     """
-    Converts flood probability scalar to d_model-dimensional token.
+    FiLM (Feature-wise Linear Modulation) conditioning for prior token.
     
-    Learns two vectors (safe_token, risk_token) and interpolates
-    between them based on the flood probability from FloodScout.
+    Instead of prepending a token (which can be diluted by many sequence tokens),
+    this generates gamma (scale) and beta (shift) parameters that modulate
+    ALL embedded patches based on the flood probability.
     
-    If prob = 1.0 -> returns risk_token
-    If prob = 0.0 -> returns safe_token
+    FiLM equation: output = gamma * input + beta
+    
+    If prob = 1.0 -> applies risk_gamma, risk_beta
+    If prob = 0.0 -> applies safe_gamma, safe_beta
     """
     def __init__(self, d_model: int = 512):
         super().__init__()
         self.d_model = d_model
         
-        # Learnable tokens (initialized with small random values)
-        self.safe_token = nn.Parameter(torch.randn(1, d_model) * 0.02)
-        self.risk_token = nn.Parameter(torch.randn(1, d_model) * 0.02)
+        # Learnable FiLM parameters for safe/risk conditions
+        # Initialized: gamma near 1.0, beta near 0.0 (identity-ish start)
+        self.safe_gamma = nn.Parameter(torch.ones(1, d_model) + torch.randn(1, d_model) * 0.02)
+        self.safe_beta = nn.Parameter(torch.randn(1, d_model) * 0.02)
+        self.risk_gamma = nn.Parameter(torch.ones(1, d_model) + torch.randn(1, d_model) * 0.02)
+        self.risk_beta = nn.Parameter(torch.randn(1, d_model) * 0.02)
     
-    def forward(self, prob: torch.Tensor) -> torch.Tensor:
+    def forward(self, prob: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             prob: (B, 1) - flood probability from FloodScout
         Returns:
-            (B, 1, d_model) - interpolated prior token
+            gamma: (B, 1, d_model) - scale parameter
+            beta: (B, 1, d_model) - shift parameter
         """
-        # Interpolate: prob * risk + (1-prob) * safe
-        # prob shape: (B, 1), tokens shape: (1, d_model)
-        # Result: (B, d_model) then unsqueeze to (B, 1, d_model)
+        # Interpolate based on probability
+        # prob shape: (B, 1), params shape: (1, d_model)
+        gamma = prob * self.risk_gamma + (1 - prob) * self.safe_gamma  # (B, d_model)
+        beta = prob * self.risk_beta + (1 - prob) * self.safe_beta      # (B, d_model)
+        return gamma.unsqueeze(1), beta.unsqueeze(1)  # (B, 1, d_model)
+
+
+# Keep old class for backward compatibility
+class PriorEmbedding(nn.Module):
+    """Legacy: token-prepending approach. Use FiLMPriorEmbedding instead."""
+    def __init__(self, d_model: int = 512):
+        super().__init__()
+        self.d_model = d_model
+        self.safe_token = nn.Parameter(torch.randn(1, d_model) * 0.02)
+        self.risk_token = nn.Parameter(torch.randn(1, d_model) * 0.02)
+    
+    def forward(self, prob: torch.Tensor) -> torch.Tensor:
         token = prob * self.risk_token + (1 - prob) * self.safe_token
         return token.unsqueeze(1)
 
@@ -457,7 +468,7 @@ class TimeRCDWithPrior(nn.Module):
     - Phase 1: Train FloodScout separately (supervised on flood labels)
     - Phase 2: Freeze FloodScout, train rest with reconstruction loss
     """
-    def __init__(self, config: TimeRCDConfig, scout_checkpoint: Optional[str] = None, context_len: int = 168):
+    def __init__(self, config: TimeRCDConfig, scout_checkpoint: Optional[str] = None, context_len: int = 336):
         super().__init__()
         self.config = config
         self.context_len = context_len
@@ -465,8 +476,8 @@ class TimeRCDWithPrior(nn.Module):
         # FloodScout (The Scout)
         self.scout = FloodScout(input_len=context_len)
         
-        # Prior token embedding
-        self.prior_embedding = PriorEmbedding(d_model=config.ts_config.d_model)
+        # FiLM conditioning embedding (replaces prior token prepending)
+        self.film_embedding = FiLMPriorEmbedding(d_model=config.ts_config.d_model)
         
         # Main TimeRCD model
         self.timercd = TimeSeriesPretrainModel(config)
@@ -499,7 +510,7 @@ class TimeRCDWithPrior(nn.Module):
     def forward(self, time_series: torch.Tensor, mask: torch.Tensor, 
                 flood_prob: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass with prior token conditioning.
+        Forward pass with FiLM conditioning based on flood probability.
         
         Args:
             time_series: (B, seq_len, num_features) - full sequence (history + future)
@@ -511,18 +522,18 @@ class TimeRCDWithPrior(nn.Module):
             (B, seq_len, num_features, d_proj) - local embeddings
         """
         # Extract history for FloodScout (only first context_len timesteps)
-        history = time_series[:, :self.context_len, :]  # (B, 168, 1)
+        history = time_series[:, :self.context_len, :]  # (B, context_len, 1)
         
         # Get flood probability from Scout (if not provided)
         if flood_prob is None:
             with torch.no_grad() if not self.scout.training else torch.enable_grad():
                 flood_prob = self.scout(history)  # (B, 1)
         
-        # Convert probability to prior token
-        prior_token = self.prior_embedding(flood_prob)  # (B, 1, d_model)
+        # Convert probability to FiLM parameters (gamma, beta)
+        gamma, beta = self.film_embedding(flood_prob)  # Each: (B, 1, d_model)
         
-        # Forward through TimeRCD with prior token
-        embeddings = self.timercd(time_series, mask, prior_token=prior_token)
+        # Forward through TimeRCD with FiLM conditioning
+        embeddings = self.timercd(time_series, mask, film_params=(gamma, beta))
         
         return embeddings
     
@@ -536,7 +547,7 @@ class TimeRCDWithPrior(nn.Module):
 # ==========================================
 
 class FloodDataset(Dataset):
-    def __init__(self, data_path, split='train', context_len=168, pred_len=336):
+    def __init__(self, data_path, split='train', context_len=336, pred_len=336):
         with open(data_path, 'rb') as f:
             data = pickle.load(f)
         self.station_data = data[split]
@@ -579,7 +590,7 @@ class FloodDataset(Dataset):
 # ==========================================
 
 class IngestionDataset(Dataset):
-    def __init__(self, train_csv, test_csv, test_index_csv, metadata_path, context_len=168, pred_len=336):
+    def __init__(self, train_csv, test_csv, test_index_csv, metadata_path, context_len=336, pred_len=336):
         self.context_len = context_len
         self.pred_len = pred_len
         self.full_len = context_len + pred_len
@@ -715,7 +726,7 @@ def ingestion_predict(args, use_prior=False):
                 future_preds_norm = reconstructed[i][future_mask]
                 label = 1 if (future_preds_norm > -1.0).any() else 0
                 results.append({'id': ids[i].item(), 'label': label})
-                print(f"id: {ids[i].item()}, label: {label}")
+                # print(f"id: {ids[i].item()}, label: {label}")
 
     df_res = pd.DataFrame(results)
     df_res.to_csv(args.predictions_out, index=False)

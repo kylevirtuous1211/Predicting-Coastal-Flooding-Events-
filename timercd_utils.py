@@ -125,14 +125,19 @@ class FloodDataset(Dataset):
         s_idx, local_idx = self.index_map[idx]
         item = self.station_data[s_idx]
         
-        # X: (168,) -> History
+        # X: (N,) -> History (may be longer than context_len in deep datasets)
         # Y: (336,) -> Future
-        X = item['X'][local_idx] # (168,)
-        Y = item['Y'][local_idx] # (336,)
+        X = item['X'][local_idx]
+        Y = item['Y'][local_idx]
+        
+        # Dynamic slicing: take the LAST context_len hours from X
+        # This allows a 720h dataset to serve 168h, 336h, or 720h experiments
+        if len(X) > self.context_len:
+            X = X[-self.context_len:]
         
         # Concatenate to form the full sequence for TimeRCD
-        full_seq = np.concatenate([X, Y]) # (504,)
-        full_seq = torch.FloatTensor(full_seq).unsqueeze(-1) # (504, 1)
+        full_seq = np.concatenate([X, Y])
+        full_seq = torch.FloatTensor(full_seq).unsqueeze(-1)  # (context_len + pred_len, 1)
         
         # Mask for Reconstruction Task
         # 0 = Observed (History), 1 = Masked (Future)

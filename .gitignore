@@ -4,9 +4,12 @@ data/
 *.png
 *.csv
 *.pkl
+*.json
+*.log
 **__pycache__foundation_data.pkl
 Time-RCD/checkpoints/
 __pycache__/
 checkpoints/
 init_submission/*
 archive/
+submission*/

@@ -1,13 +1,18 @@
 """
-Phase 2 Training: TimeRCD with Prior Token
+Phase 2 Training: TimeRCD with Prior Token (FiLM Conditioning)
 
-Finetune TimeRCD model with frozen FloodScout providing prior token conditioning.
+Finetune TimeRCD model with frozen FloodScout providing FiLM conditioning.
 - FloodScout: Frozen (trained in Phase 1)
-- PriorEmbedding: Trainable
+- FiLMPriorEmbedding: Trainable
 - TimeRCD: Trainable (initialized from pretrained weights)
 
+Configuration:
+    - Resolution: Patch Size 21
+    - Sensitivity: Flood Weight 8.0
+    - Physics: Context Length 336h
+
 Usage:
-    python train_timercd_prior.py --epochs 20 --batch_size 256
+    python train_timercd_prior.py --epochs 20 --batch_size 64 --patch_size 21 --context_len 336 --flood_weight 8.0
 """
 
 import torch
@@ -27,19 +32,23 @@ from timercd_utils import FloodDataset
 from model_prior_token import TimeRCDWithPrior, TimeRCDConfig
 
 # Configuration
-DATA_FILE = "foundation_data.pkl"
-CHECKPOINT_DIR = "checkpoints/timercd_prior"
+DATA_FILE = "foundation_data_deep.pkl"  # 720h history dataset (supports context_len up to 720)
+CHECKPOINT_DIR = "checkpoints/timercd_prior_FiLM"
 SCOUT_CHECKPOINT = "scout.pkl"
 TIMERCD_PRETRAINED = "Time-RCD/checkpoints/full_mask_anomaly_head_pretrain_checkpoint_best.pth"
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-BATCH_SIZE = 256
+# Default Hyperparameters (can be overridden via CLI)
+BATCH_SIZE = 64
 EPOCHS = 20
 LEARNING_RATE = 1e-4
+PATCH_SIZE = 21       # Resolution
+FLOOD_WEIGHT = 8.0    # Sensitivity
+CONTEXT_LEN = 336     # Physics (336h = 14 days)
 
 
-def weighted_reconstruction_loss(embeddings, targets, mask, model, flood_weight=10.0):
+def weighted_reconstruction_loss(embeddings, targets, mask, model, flood_weight=FLOOD_WEIGHT):
     """
     Custom Loss that penalizes errors on FLOOD values much harder than normal values.
     """
@@ -54,11 +63,11 @@ def weighted_reconstruction_loss(embeddings, targets, mask, model, flood_weight=
     return final_loss
 
 
-def test_prior(model, device, split='test'):
+def test_prior(model, device, context_len=CONTEXT_LEN, split='test'):
     """Evaluate TimeRCDWithPrior model."""
     from sklearn.metrics import matthews_corrcoef, f1_score, confusion_matrix
     
-    test_dataset = FloodDataset(DATA_FILE, split=split)
+    test_dataset = FloodDataset(DATA_FILE, split=split, context_len=context_len)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
     model.eval()
@@ -71,7 +80,7 @@ def test_prior(model, device, split='test'):
             mask = batch['mask'].to(device)
             
             # Get flood label from future values
-            Y = time_series[:, 168:, 0]  # Future sea level
+            Y = time_series[:, context_len:, 0]  # Future sea level
             flood_labels = (Y > 0).any(dim=1).cpu().numpy()
             
             attention_mask = torch.ones((time_series.size(0), time_series.size(1)), dtype=torch.bool).to(device)
@@ -86,7 +95,7 @@ def test_prior(model, device, split='test'):
             reconstructed = reconstructed.view(time_series.shape)
             
             # Get peak prediction in future
-            future_preds = reconstructed[:, 168:, 0]
+            future_preds = reconstructed[:, context_len:, 0]
             peak_vals = future_preds.max(dim=1)[0].cpu().numpy()
             
             all_preds.extend(peak_vals)
@@ -114,26 +123,32 @@ def test_prior(model, device, split='test'):
     return {'mcc': best_mcc, 'f1': best_f1, 'cm': cm, 'best_thresh': best_thresh}
 
 
-def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LEARNING_RATE, flood_weight=5.0):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LEARNING_RATE, 
+          flood_weight=FLOOD_WEIGHT, patch_size=PATCH_SIZE, context_len=CONTEXT_LEN):
+    device = torch.device("cuda:1[]" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"\nHyperparameters:")
+    print(f"  - Patch Size (Resolution): {patch_size}")
+    print(f"  - Flood Weight (Sensitivity): {flood_weight}")
+    print(f"  - Context Length (Physics): {context_len}h ({context_len//24} days)")
+    print()
     
     # Load Dataset
     print("Loading data...")
-    train_dataset = FloodDataset(DATA_FILE, split='train')
+    train_dataset = FloodDataset(DATA_FILE, split='train', context_len=context_len)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     
     # Initialize Model
-    print("Initializing TimeRCDWithPrior...")
+    print("Initializing TimeRCDWithPrior (FiLM conditioning)...")
     config = TimeRCDConfig()
     config.ts_config.num_features = 1
     config.ts_config.d_model = 512
-    config.ts_config.patch_size = 16
+    config.ts_config.patch_size = patch_size
     
     model = TimeRCDWithPrior(
         config, 
         scout_checkpoint=SCOUT_CHECKPOINT,
-        context_len=168
+        context_len=context_len
     ).to(device)
     
     # Freeze Scout (Phase 2: Scout is frozen)
@@ -154,14 +169,17 @@ def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LEARNING_RATE, flood_weight=5
             else:
                 new_state_dict[k] = v
         
+        # Filter incompatible layers (embedding/projection depend on patch_size)
+        incompatible_keys = ['embedding_layer', 'projection_layer']
+        filtered_state_dict = {
+            k: v for k, v in new_state_dict.items() 
+            if not any(ik in k for ik in incompatible_keys)
+        }
+        print(f"  Skipping {len(new_state_dict) - len(filtered_state_dict)} incompatible layers (patch_size dependent)")
+        
         # Load into timercd submodule
-        try:
-            model.timercd.load_state_dict(new_state_dict, strict=True)
-            print("Successfully loaded pretrained TimeRCD weights (Strict).")
-        except RuntimeError as e:
-            print(f"Strict load failed: {e}")
-            missing, unexpected = model.timercd.load_state_dict(new_state_dict, strict=False)
-            print(f"Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+        missing, unexpected = model.timercd.load_state_dict(filtered_state_dict, strict=False)
+        print(f"  Loaded {len(filtered_state_dict) - len(missing)} pretrained layers")
     else:
         print(f"WARNING: Pretrained checkpoint not found at {TIMERCD_PRETRAINED}")
     
@@ -215,7 +233,7 @@ def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LEARNING_RATE, flood_weight=5
         
         # Validation
         print(f"Running Validation...")
-        metrics = test_prior(model, device, split='test')
+        metrics = test_prior(model, device, context_len=context_len, split='test')
         val_mccs.append(metrics['mcc'])
         val_f1s.append(metrics['f1'])
         
@@ -268,11 +286,23 @@ def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LEARNING_RATE, flood_weight=5
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--flood_weight", type=float, default=5.0)
+    parser = argparse.ArgumentParser(description="Train TimeRCD with FiLM Prior Conditioning")
+    parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size")
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="Learning rate")
+    parser.add_argument("--flood_weight", type=float, default=FLOOD_WEIGHT, 
+                        help="Sensitivity: Weight for flood reconstruction loss")
+    parser.add_argument("--patch_size", type=int, default=PATCH_SIZE,
+                        help="Resolution: Patch size for time series encoder")
+    parser.add_argument("--context_len", type=int, default=CONTEXT_LEN,
+                        help="Physics: Context length in hours (e.g., 168, 336, 720)")
     args = parser.parse_args()
     
-    train(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, flood_weight=args.flood_weight)
+    train(
+        epochs=args.epochs, 
+        batch_size=args.batch_size, 
+        lr=args.lr, 
+        flood_weight=args.flood_weight,
+        patch_size=args.patch_size,
+        context_len=args.context_len
+    )

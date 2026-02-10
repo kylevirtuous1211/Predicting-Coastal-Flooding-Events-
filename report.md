@@ -44,3 +44,20 @@ id	station_name	hist_start
 │                              ▼                                          │
 │                    Reconstruction Loss (MSE)                            │
 └─────────────────────────────────────────────────────────────────────────┘
+
+## Best configuration:
+context length: 720h (30 days)
+loss weight: 8
+patch size: 21
+
+## test context lengths:
+
+============================================================
+Context (h)  Days     Best MCC     Best Epoch   Final MCC   
+--------------------------------------------------------
+168          7        0.2735       15           0.2643      
+336          14       0.3112       19           0.3065      
+720          30       0.3359       19           0.3303      
+
+✅ BEST CONTEXT LENGTH: 720h (30 days)
+   MCC=0.3359 at epoch 19
