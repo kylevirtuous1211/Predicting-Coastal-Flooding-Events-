@@ -1,18 +1,18 @@
 """
-Phase 2 Training: TimeRCD with Prior Token (FiLM Conditioning)
+Phase 2 Training: TimeRCD with Prior Token (Concatenation)
 
-Finetune TimeRCD model with frozen FloodScout providing FiLM conditioning.
+Finetune TimeRCD model with frozen FloodScout providing Prior Token conditioning.
 - FloodScout: Frozen (trained in Phase 1)
-- FiLMPriorEmbedding: Trainable
+- PriorEmbedding: Trainable (learns to map probability to token)
 - TimeRCD: Trainable (initialized from pretrained weights)
 
 Configuration:
     - Resolution: Patch Size 21
     - Sensitivity: Flood Weight 8.0
-    - Physics: Context Length 336h
+    - Physics: Context Length 1800h
 
 Usage:
-    python train_timercd_prior.py --epochs 20 --batch_size 64 --patch_size 21 --context_len 336 --flood_weight 8.0
+    python train_timercd_prior.py --epochs 40 --batch_size 64
 """
 
 import torch
@@ -32,20 +32,20 @@ from timercd_utils import FloodDataset
 from model_prior_token import TimeRCDWithPrior, TimeRCDConfig
 
 # Configuration
-DATA_FILE = "foundation_data_deep.pkl"  # 720h history dataset (supports context_len up to 720)
-CHECKPOINT_DIR = "checkpoints/timercd_prior_FiLM"
-SCOUT_CHECKPOINT = "scout.pkl"
+DATA_FILE = "foundation_data_deep_105d.pkl"  # 2520h history dataset
+CHECKPOINT_DIR = "checkpoints/timercd_prior_token"
+SCOUT_CHECKPOINT = "checkpoints/scout/scout_best.pth"
 TIMERCD_PRETRAINED = "Time-RCD/checkpoints/full_mask_anomaly_head_pretrain_checkpoint_best.pth"
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # Default Hyperparameters (can be overridden via CLI)
 BATCH_SIZE = 64
-EPOCHS = 20
+EPOCHS = 40
 LEARNING_RATE = 1e-4
 PATCH_SIZE = 21       # Resolution
 FLOOD_WEIGHT = 8.0    # Sensitivity
-CONTEXT_LEN = 336     # Physics (336h = 14 days)
+CONTEXT_LEN = 1800     # Physics (1800h = 75 days)
 
 
 def weighted_reconstruction_loss(embeddings, targets, mask, model, flood_weight=FLOOD_WEIGHT):
@@ -63,7 +63,7 @@ def weighted_reconstruction_loss(embeddings, targets, mask, model, flood_weight=
     return final_loss
 
 
-def test_prior(model, device, context_len=CONTEXT_LEN, split='test'):
+def test_prior(model, device, context_len=CONTEXT_LEN, split='test', flood_weight=FLOOD_WEIGHT):
     """Evaluate TimeRCDWithPrior model."""
     from sklearn.metrics import matthews_corrcoef, f1_score, confusion_matrix
     
@@ -74,6 +74,7 @@ def test_prior(model, device, context_len=CONTEXT_LEN, split='test'):
     all_preds = []
     all_labels = []
     
+    val_losses = []
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating"):
             time_series = batch['time_series'].to(device)
@@ -91,6 +92,11 @@ def test_prior(model, device, context_len=CONTEXT_LEN, split='test'):
             
             # Forward with prior token
             embeddings = model(input_seq, attention_mask)
+            
+            # Reconstruction Loss
+            loss = weighted_reconstruction_loss(embeddings, time_series, mask, model, flood_weight=flood_weight)
+            val_losses.append(loss.item())
+
             reconstructed = model.reconstruction_head(embeddings)
             reconstructed = reconstructed.view(time_series.shape)
             
@@ -100,6 +106,8 @@ def test_prior(model, device, context_len=CONTEXT_LEN, split='test'):
             
             all_preds.extend(peak_vals)
             all_labels.extend(flood_labels)
+    
+    avg_val_loss = np.mean(val_losses)
     
     # Find best threshold
     best_mcc = -1
@@ -117,15 +125,16 @@ def test_prior(model, device, context_len=CONTEXT_LEN, split='test'):
     preds_bin = [1 if x > best_thresh else 0 for x in all_preds]
     cm = confusion_matrix(all_labels, preds_bin)
     
+    print(f"  Val Loss: {avg_val_loss:.6f}")
     print(f"  Val MCC: {best_mcc:.4f} (thresh={best_thresh:.2f}), F1: {best_f1:.4f}")
     print(f"  Confusion Matrix:\n{cm}")
     
-    return {'mcc': best_mcc, 'f1': best_f1, 'cm': cm, 'best_thresh': best_thresh}
+    return {'mcc': best_mcc, 'f1': best_f1, 'cm': cm, 'best_thresh': best_thresh, 'val_loss': avg_val_loss}
 
 
 def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LEARNING_RATE, 
           flood_weight=FLOOD_WEIGHT, patch_size=PATCH_SIZE, context_len=CONTEXT_LEN):
-    device = torch.device("cuda:1[]" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"\nHyperparameters:")
     print(f"  - Patch Size (Resolution): {patch_size}")
@@ -135,7 +144,7 @@ def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LEARNING_RATE,
     
     # Load Dataset
     print("Loading data...")
-    train_dataset = FloodDataset(DATA_FILE, split='train', context_len=context_len)
+    train_dataset = FloodDataset(DATA_FILE, split='train', context_len=context_len, augment=True)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     
     # Initialize Model
@@ -193,6 +202,7 @@ def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LEARNING_RATE,
     print("Starting Training...")
     
     train_losses = []
+    val_losses = []
     val_mccs = []
     val_f1s = []
     best_mcc = -1
@@ -233,7 +243,8 @@ def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LEARNING_RATE,
         
         # Validation
         print(f"Running Validation...")
-        metrics = test_prior(model, device, context_len=context_len, split='test')
+        metrics = test_prior(model, device, context_len=context_len, split='test', flood_weight=flood_weight)
+        val_losses.append(metrics['val_loss'])
         val_mccs.append(metrics['mcc'])
         val_f1s.append(metrics['f1'])
         
@@ -258,6 +269,7 @@ def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LEARNING_RATE,
         
         plt.subplot(1, 2, 1)
         plt.plot(train_losses, label='Train Loss')
+        plt.plot(val_losses, label='Val Loss')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.title('Training Loss')

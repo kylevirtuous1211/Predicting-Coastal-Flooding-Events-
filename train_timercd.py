@@ -19,13 +19,16 @@ from models.time_rcd.TimeRCD_pretrain_multi import TimeSeriesPretrainModel
 from models.time_rcd.time_rcd_config import TimeRCDConfig
 
 # Configuration
-DATA_FILE = "foundation_data.pkl"
+DATA_FILE = "foundation_data_deep_105d.pkl"
 CHECKPOINT_DIR = "checkpoints/timercd_finetune"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-BATCH_SIZE = 256
-EPOCHS = 20
+BATCH_SIZE = 64 # Reduced from 256 for longer context
+EPOCHS = 40     # Increased from 20
 LEARNING_RATE = 1e-4
+CONTEXT_LEN = 1800
+PATCH_SIZE = 21
+FLOOD_WEIGHT = 8.0
 
 def weighted_reconstruction_loss(embeddings, targets, mask, model, flood_weight=10.0):
     """
@@ -53,66 +56,109 @@ def weighted_reconstruction_loss(embeddings, targets, mask, model, flood_weight=
 
     return final_loss
 
-def train():
+    return final_loss
+
+def train(resume_checkpoint=None, epochs=EPOCHS):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     # Load Dataset
     print("Loading data...")
-    train_dataset = FloodDataset(DATA_FILE, split='train')
+    # Enable Augmentation for Training
+    train_dataset = FloodDataset(DATA_FILE, split='train', context_len=CONTEXT_LEN, augment=True)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    
-    # Initialize Model (Load Pretrained if available logic here, for now strictly init)
-    # TODO: Load actual pretrained weights if user provides path or if they exist in standard loc
-    # For now, we initialize from scratch as placeholder for "Pretrained" structure availability
-    print("Initializing TimeRCD...")
-    config = TimeRCDConfig()
-    config.ts_config.num_features = 1
-    config.ts_config.d_model = 512 # Default
-    # Ensure seq_len covers our 504 length
-    # TimeRCD usually handles variable length or has max_seq_len
     
     # Initialize Model
     print("Initializing TimeRCD...")
     config = TimeRCDConfig()
     config.ts_config.num_features = 1
     config.ts_config.d_model = 512 # Default
-    config.ts_config.patch_size = 16 # As seen in model_wrapper.py for Univariate
+    config.ts_config.patch_size = PATCH_SIZE 
     
     model = TimeSeriesPretrainModel(config).to(device)
     
-    # Load Pretrained Weights
-    pretrained_path = "Time-RCD/checkpoints/full_mask_anomaly_head_pretrain_checkpoint_best.pth"
-    if os.path.exists(pretrained_path):
-        print(f"Loading pretrained weights from {pretrained_path}")
-        state_dict = torch.load(pretrained_path, map_location=device)
-        
+    start_epoch = 0
+    
+    if resume_checkpoint and os.path.exists(resume_checkpoint):
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
+        state_dict = torch.load(resume_checkpoint, map_location=device)
         if 'model_state_dict' in state_dict:
             state_dict = state_dict['model_state_dict']
             
-        # Handle potential prefix issues (e.g. 'module.' if DDP was used)
+        # Handle prefix issues
         new_state_dict = {}
         for k, v in state_dict.items():
             if k.startswith('module.'):
                 new_state_dict[k[7:]] = v
             else:
                 new_state_dict[k] = v
-                
-        # TimeRCD pretrained model has specific keys. 
-        # We need to match our model structure.
-        # If strict loading fails, we might need to filter keys or allow non-strict.
-        # Attempting strict load first, then loose.
+        
+        # Try to load checkpoint
         try:
             model.load_state_dict(new_state_dict, strict=True)
-            print("Successfully loaded pretrained weights (Strict).")
+            print("Checkpoint loaded (Strict).")
         except RuntimeError as e:
             print(f"Strict load failed: {e}")
-            print("Attempting non-strict load...")
-            missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
-            print(f"Missing keys: {len(missing)}")
+            print("Attempting non-strict load with shape mismatch filtering...")
+            
+            # Filter out keys with shape mismatch
+            model_state_dict = model.state_dict()
+            filtered_state_dict = {}
+            for k, v in new_state_dict.items():
+                if k in model_state_dict:
+                    if v.shape == model_state_dict[k].shape:
+                        filtered_state_dict[k] = v
+                    else:
+                        print(f"Skipping {k} due to shape mismatch: {v.shape} vs {model_state_dict[k].shape}")
+                else:
+                    print(f"Skipping {k} as it is not in the model.")
+            
+            missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
+            print(f"Loaded with filtering. Missing: {len(missing)}")
             print(f"Unexpected keys: {len(unexpected)}")
+        
+        # Try to infer start epoch from filename (e.g., timercd_epoch_40.pth)
+        try:
+            basename = os.path.basename(resume_checkpoint)
+            parts = basename.replace('.pth', '').split('_')
+            if 'epoch' in parts:
+                idx = parts.index('epoch')
+                if idx + 1 < len(parts):
+                    start_epoch = int(parts[idx+1])
+                    print(f"Resuming at Epoch {start_epoch + 1}")
+        except:
+            print("Could not infer start epoch from filename.")
+            
     else:
-        print(f"WARNING: Pretrained checkpoint not found at {pretrained_path}. Training from scratch.")
+        # Load Pretrained Weights (Original Logic)
+        pretrained_path = "Time-RCD/checkpoints/full_mask_anomaly_head_pretrain_checkpoint_best.pth"
+        if os.path.exists(pretrained_path):
+            print(f"Loading pretrained weights from {pretrained_path}")
+            state_dict = torch.load(pretrained_path, map_location=device)
+            if 'model_state_dict' in state_dict:
+                state_dict = state_dict['model_state_dict']
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            try:
+                model.load_state_dict(new_state_dict, strict=True)
+                print("Successfully loaded pretrained weights (Strict).")
+            except RuntimeError as e:
+                print(f"Strict load failed: {e}")
+                # Filter out keys with shape mismatch
+                model_state_dict = model.state_dict()
+                filtered_state_dict = {}
+                for k, v in new_state_dict.items():
+                    if k in model_state_dict:
+                        if v.shape == model_state_dict[k].shape:
+                            filtered_state_dict[k] = v
+                missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
+                print(f"Loaded with filtering. Missing: {len(missing)}")
+        else:
+            print(f"WARNING: Pretrained checkpoint not found at {pretrained_path}. Training from scratch.")
 
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     
@@ -125,66 +171,45 @@ def train():
     
     os.makedirs("training_plots", exist_ok=True)
     
-    for epoch in range(EPOCHS):
+    # Adjust total epochs relative to start
+    total_epochs = start_epoch + epochs
+    
+    for epoch in range(start_epoch, total_epochs):
         total_loss = 0
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")):
-            # Batch: {'time_series': (B, 504, 1), 'mask': (B, 504), 'threshold': ...}
-            
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{total_epochs}")):
             time_series = batch['time_series'].to(device) # (B, 504, 1)
-            mask = batch['mask'].to(device)               # (B, 504) -> 1 where we want to predict (Future)
-            
-            # Create Attention Mask (assuming all valid since fixed length)
-            # Shape: (B, 504)
+            mask = batch['mask'].to(device)               # (B, 504)
             attention_mask = torch.ones((time_series.size(0), time_series.size(1)), dtype=torch.bool).to(device)
             
-            # CRITICAL FIX: Zero out the Future in Training too!
-            # Otherwise we are training an Autoencoder (Copy task), not a Forecaster.
             train_input = time_series.clone()
             train_input[mask.bool()] = 0.0
             
             optimizer.zero_grad()
-            
-            # Forward Pass
-            # TimeSeriesPretrainModel (from TimeRCD_pretrain_multi.py) forward returns embeddings
-            # We must pass attention_mask as the second argument
             embeddings = model(train_input, attention_mask) 
-            
-            # Calculate Loss
-            # We want to reconstruct the MASKED part (The Future)
-            loss = weighted_reconstruction_loss(embeddings, time_series, mask, model, flood_weight=5.0)
-            
+            loss = weighted_reconstruction_loss(embeddings, time_series, mask, model, flood_weight=FLOOD_WEIGHT)
             loss.backward()
             optimizer.step()
-            
             total_loss += loss.item()
             
         avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {avg_loss:.6f}")
-        
+        print(f"Epoch {epoch+1}/{total_epochs}, Loss: {avg_loss:.6f}")
         train_losses.append(avg_loss)
         
-        # Save Checkpoint
         torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"timercd_epoch_{epoch+1}.pth"))
         
-        # Validation
         print(f"Running Validation for Epoch {epoch+1}...")
-        metrics = test(model=model, device=device, split='test')
+        metrics = test(model=model, device=device, split='test', 
+                       context_len=CONTEXT_LEN, patch_size=PATCH_SIZE, data_file=DATA_FILE)
         val_mccs.append(metrics['mcc'])
         val_f1s.append(metrics['f1'])
+        model.train()
         
-        model.train() # Switch back to train mode
-        
-        # Plotting
+        # Plotting code follows (omitted for brevity, can remain as is if not in replacement chunk)
         plt.figure(figsize=(10, 5))
-        plt.plot(range(1, epoch+2), train_losses, label='Training Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('MSE Loss')
-        plt.title('Training Loss Over Time')
-        plt.legend()
-        plt.grid(True)
+        plt.plot(range(start_epoch + 1, epoch + 2), train_losses, label='Training Loss')
         plt.savefig("training_plots/loss.png")
         plt.close()
-        
+
         plt.figure(figsize=(10, 5))
         plt.plot(range(1, epoch+2), val_mccs, label='MCC')
         plt.plot(range(1, epoch+2), val_f1s, label='F1 Score')
@@ -199,4 +224,10 @@ def train():
     print("Training Complete.")
 
 if __name__ == "__main__":
-    train()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of ADDITIONAL epochs to train")
+    args = parser.parse_args()
+    
+    train(resume_checkpoint=args.resume, epochs=args.epochs)

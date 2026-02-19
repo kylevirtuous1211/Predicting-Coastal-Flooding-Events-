@@ -34,7 +34,8 @@ BATCH_SIZE = 32
 
 from sklearn.metrics import confusion_matrix, matthews_corrcoef, f1_score
 
-def test(model=None, device=None, split='test', use_prior=False, checkpoint_path=None):
+def test(model=None, device=None, split='test', use_prior=False, checkpoint_path=None, 
+         context_len=168, patch_size=16, data_file=DATA_FILE):
     """
     Test TimeRCD model with optional Prior Token support.
     
@@ -44,6 +45,9 @@ def test(model=None, device=None, split='test', use_prior=False, checkpoint_path
         split: 'train' or 'test'
         use_prior: If True, use TimeRCDWithPrior model
         checkpoint_path: Override default checkpoint path
+        context_len: Length of history window
+        patch_size: Patch size for TimeRCD
+        data_file: Path to dataset file
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -51,7 +55,8 @@ def test(model=None, device=None, split='test', use_prior=False, checkpoint_path
     
     # Load Test Dataset
     print(f"Loading {split} data for evaluation...")
-    test_dataset = FloodDataset(DATA_FILE, split=split)
+    # NOTE: pred_len is fixed at 336 for now as per competition/standard
+    test_dataset = FloodDataset(data_file, split=split, context_len=context_len)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
     # Determine checkpoint path
@@ -74,7 +79,7 @@ def test(model=None, device=None, split='test', use_prior=False, checkpoint_path
             config = TimeRCDConfig()
             config.ts_config.num_features = 1
             config.ts_config.d_model = 512
-            config.ts_config.patch_size = 16
+            config.ts_config.patch_size = patch_size
             
             model = TimeSeriesPretrainModel(config).to(device)
         

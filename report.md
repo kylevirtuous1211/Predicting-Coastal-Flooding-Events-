@@ -46,7 +46,7 @@ id	station_name	hist_start
 └─────────────────────────────────────────────────────────────────────────┘
 
 ## Best configuration:
-context length: 720h (30 days)
+context length: 1800h (30 days)
 loss weight: 8
 patch size: 21
 

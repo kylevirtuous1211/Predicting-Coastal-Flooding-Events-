@@ -243,15 +243,14 @@ class TimeSeriesEncoder(nn.Module):
             elif 'bias' in name:
                 nn.init.constant_(param, 0.0)
 
-    def forward(self, time_series, mask, film_params=None):
+    def forward(self, time_series, mask, prior_token=None):
         """
-        Forward pass with optional FiLM conditioning.
+        Forward pass with optional Prior Token conditioning.
         
         Args:
             time_series: (B, seq_len, num_features)
             mask: (B, seq_len) attention mask
-            film_params: Optional tuple (gamma, beta) each of shape (B, 1, d_model)
-                         for FiLM conditioning: output = gamma * embedding + beta
+            prior_token: Optional (B, 1, d_model) to prepend to sequence
         """
         if time_series.dim() == 2: time_series = time_series.unsqueeze(-1)
         device = time_series.device
@@ -270,21 +269,38 @@ class TimeSeriesEncoder(nn.Module):
         feature_id = torch.arange(num_features, device=device).repeat_interleave(num_patches).unsqueeze(0).expand(B, -1)
         embedded_patches = self.embedding_layer(patches)
 
-        # Apply FiLM conditioning if provided: output = gamma * input + beta
-        if film_params is not None:
-            gamma, beta = film_params  # Each: (B, 1, d_model)
-            embedded_patches = gamma * embedded_patches + beta
-
+        # Prepend Prior Token if provided
+        if prior_token is not None:
+             # prior_token: (B, 1, d_model)
+             embedded_patches = torch.cat([prior_token, embedded_patches], dim=1)
+             
+             # Adjust identifiers and masks for the extra token
+             prior_id = torch.zeros((B, 1), device=device, dtype=feature_id.dtype)
+             feature_id = torch.cat([prior_id, feature_id], dim=1)
+             
+             # Extend mask: Prior token is always visible (True)
+             # full_mask construction below needs update.
+             
         mask_view = mask.view(B, num_patches, self.patch_size)
         patch_mask = mask_view.sum(dim=-1) > 0
         full_mask = patch_mask.unsqueeze(1).expand(-1, num_features, -1).reshape(B, num_features * num_patches)
+        
+        if prior_token is not None:
+            prior_mask_val = torch.ones((B, 1), device=device, dtype=full_mask.dtype)
+            full_mask = torch.cat([prior_mask_val, full_mask], dim=1)
 
-        freqs = self.rope_embedder(total_length).to(device) if self.use_rope else None
+        # RoPE needs total length matching actual sequence
+        seq_len_with_prior = embedded_patches.size(1)
+        freqs = self.rope_embedder(seq_len_with_prior).to(device) if self.use_rope else None
         
         if num_features > 1:
             output = self.transformer_encoder(embedded_patches, freqs=freqs, src_id=feature_id, attn_mask=full_mask)
         else:
             output = self.transformer_encoder(embedded_patches, freqs=freqs, attn_mask=full_mask)
+
+        if prior_token is not None:
+            # Remove prior token from output before projection
+            output = output[:, 1:, :]
 
         patch_embeddings = output
         patch_proj = self.projection_layer(patch_embeddings)
@@ -317,8 +333,8 @@ class TimeSeriesPretrainModel(nn.Module):
             nn.Linear(ts_config.d_proj // 2, 2)
         )
 
-    def forward(self, time_series: torch.Tensor, mask: Optional[torch.Tensor] = None, film_params: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
-        return self.ts_encoder(time_series, mask, film_params=film_params)
+    def forward(self, time_series: torch.Tensor, mask: Optional[torch.Tensor] = None, prior_token: Optional[torch.Tensor] = None):
+        return self.ts_encoder(time_series, mask, prior_token=prior_token)
 
     def masked_reconstruction_loss(self, local_embeddings, original_time_series, mask):
         batch_size, seq_len, num_features = original_time_series.shape
@@ -402,43 +418,7 @@ class FloodScout(nn.Module):
         return prob
 
 
-class FiLMPriorEmbedding(nn.Module):
-    """
-    FiLM (Feature-wise Linear Modulation) conditioning for prior token.
-    
-    Instead of prepending a token (which can be diluted by many sequence tokens),
-    this generates gamma (scale) and beta (shift) parameters that modulate
-    ALL embedded patches based on the flood probability.
-    
-    FiLM equation: output = gamma * input + beta
-    
-    If prob = 1.0 -> applies risk_gamma, risk_beta
-    If prob = 0.0 -> applies safe_gamma, safe_beta
-    """
-    def __init__(self, d_model: int = 512):
-        super().__init__()
-        self.d_model = d_model
-        
-        # Learnable FiLM parameters for safe/risk conditions
-        # Initialized: gamma near 1.0, beta near 0.0 (identity-ish start)
-        self.safe_gamma = nn.Parameter(torch.ones(1, d_model) + torch.randn(1, d_model) * 0.02)
-        self.safe_beta = nn.Parameter(torch.randn(1, d_model) * 0.02)
-        self.risk_gamma = nn.Parameter(torch.ones(1, d_model) + torch.randn(1, d_model) * 0.02)
-        self.risk_beta = nn.Parameter(torch.randn(1, d_model) * 0.02)
-    
-    def forward(self, prob: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            prob: (B, 1) - flood probability from FloodScout
-        Returns:
-            gamma: (B, 1, d_model) - scale parameter
-            beta: (B, 1, d_model) - shift parameter
-        """
-        # Interpolate based on probability
-        # prob shape: (B, 1), params shape: (1, d_model)
-        gamma = prob * self.risk_gamma + (1 - prob) * self.safe_gamma  # (B, d_model)
-        beta = prob * self.risk_beta + (1 - prob) * self.safe_beta      # (B, d_model)
-        return gamma.unsqueeze(1), beta.unsqueeze(1)  # (B, 1, d_model)
+
 
 
 # Keep old class for backward compatibility
@@ -476,8 +456,8 @@ class TimeRCDWithPrior(nn.Module):
         # FloodScout (The Scout)
         self.scout = FloodScout(input_len=context_len)
         
-        # FiLM conditioning embedding (replaces prior token prepending)
-        self.film_embedding = FiLMPriorEmbedding(d_model=config.ts_config.d_model)
+        # Prior conditioning embedding (concatenation strategy)
+        self.prior_embedding = PriorEmbedding(d_model=config.ts_config.d_model)
         
         # Main TimeRCD model
         self.timercd = TimeSeriesPretrainModel(config)
@@ -529,11 +509,11 @@ class TimeRCDWithPrior(nn.Module):
             with torch.no_grad() if not self.scout.training else torch.enable_grad():
                 flood_prob = self.scout(history)  # (B, 1)
         
-        # Convert probability to FiLM parameters (gamma, beta)
-        gamma, beta = self.film_embedding(flood_prob)  # Each: (B, 1, d_model)
+        # Convert probability to Prior Token
+        prior_token = self.prior_embedding(flood_prob)  # (B, 1, d_model)
         
-        # Forward through TimeRCD with FiLM conditioning
-        embeddings = self.timercd(time_series, mask, film_params=(gamma, beta))
+        # Forward through TimeRCD with Prior Token
+        embeddings = self.timercd(time_series, mask, prior_token=prior_token)
         
         return embeddings
     
@@ -568,6 +548,13 @@ class FloodDataset(Dataset):
         item = self.station_data[s_idx]
         X = item['X'][local_idx]
         Y = item['Y'][local_idx]
+        
+        # Slice to respect configured lengths
+        if len(X) > self.context_len:
+            X = X[-self.context_len:]
+        if len(Y) > self.pred_len:
+            Y = Y[:self.pred_len]
+            
         full_seq = np.concatenate([X, Y])
         full_seq = torch.FloatTensor(full_seq).unsqueeze(-1)
         mask = torch.zeros(self.full_len, dtype=torch.bool)
@@ -645,7 +632,7 @@ class IngestionDataset(Dataset):
         if start_idx + self.context_len > len(values):
              hist_seq = values[start_idx:]
              pad_len = self.context_len - len(hist_seq)
-             hist_seq = np.pad(hist_seq, (0, pad_len))
+             hist_seq = np.pad(hist_seq, (pad_len, 0))
         else:
             hist_seq = values[start_idx : start_idx + self.context_len]
             
@@ -677,11 +664,11 @@ def ingestion_predict(args, use_prior=False):
     dataset = IngestionDataset(args.train_hourly, args.test_hourly, args.test_index, metadata_path)
     loader = DataLoader(dataset, batch_size=32, shuffle=False)
     
-    checkpoint_path = "model.pkl"
+    checkpoint_path = args.model
     config = TimeRCDConfig()
     config.ts_config.num_features = 1
     config.ts_config.d_model = 512
-    config.ts_config.patch_size = 16
+    config.ts_config.patch_size = 21
     
     if use_prior:
         scout_checkpoint = getattr(args, 'scout_checkpoint', 'scout.pkl')
@@ -724,13 +711,15 @@ def ingestion_predict(args, use_prior=False):
             for i in range(len(ids)):
                 future_mask = mask[i].bool()
                 future_preds_norm = reconstructed[i][future_mask]
-                label = 1 if (future_preds_norm > -1.0).any() else 0
+                label = 1 if (future_preds_norm > -.1).any() else 0
                 results.append({'id': ids[i].item(), 'label': label})
                 # print(f"id: {ids[i].item()}, label: {label}")
 
     df_res = pd.DataFrame(results)
     df_res.to_csv(args.predictions_out, index=False)
     print(f"Predictions saved to {args.predictions_out}")
+    if not df_res.empty:
+        print(f"Predicted anomaly percentage: {df_res['label'].mean() * 100:.2f}%")
 
 
 if __name__ == "__main__":

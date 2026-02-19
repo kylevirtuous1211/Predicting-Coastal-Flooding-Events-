@@ -334,7 +334,8 @@ class TimeSeriesPretrainModel(nn.Module):
 # ==========================================
 
 class FloodDataset(Dataset):
-    def __init__(self, data_path, split='train', context_len=168, pred_len=336):
+    def __init__(self, data_path, split='train', context_len=168, pred_len=336, augment=False):
+        self.augment = augment
         with open(data_path, 'rb') as f:
             data = pickle.load(f)
         self.station_data = data[split]
@@ -356,6 +357,17 @@ class FloodDataset(Dataset):
         X = item['X'][local_idx]
         Y = item['Y'][local_idx]
         full_seq = np.concatenate([X, Y])
+        
+        # Apply Data Augmentation (only if enabled)
+        if self.augment:
+            # 1. Random Scaling (0.9 to 1.1)
+            scale = np.random.uniform(0.9, 1.1)
+            full_seq = full_seq * scale
+            
+            # 2. Jitter (Gaussian noise, sigma=0.01)
+            noise = np.random.normal(0, 0.01, size=full_seq.shape)
+            full_seq = full_seq + noise
+            
         full_seq = torch.FloatTensor(full_seq).unsqueeze(-1)
         mask = torch.zeros(self.full_len, dtype=torch.bool)
         mask[self.context_len:] = True
@@ -367,7 +379,7 @@ class FloodDataset(Dataset):
 # ==========================================
 
 class IngestionDataset(Dataset):
-    def __init__(self, train_csv, test_csv, test_index_csv, metadata_path, context_len=168, pred_len=336):
+    def __init__(self, train_csv, test_csv, test_index_csv, metadata_path, context_len=1800, pred_len=336):
         self.context_len = context_len
         self.pred_len = pred_len
         self.full_len = context_len + pred_len
@@ -444,14 +456,14 @@ def ingestion_predict(args):
         print("Metadata not found! Please ensure station_metadata.pkl is present.")
         return
 
-    dataset = IngestionDataset(args.train_hourly, args.test_hourly, args.test_index, metadata_path)
+    dataset = IngestionDataset(args.train_hourly, args.test_hourly, args.test_index, metadata_path, context_len=1800)
     loader = DataLoader(dataset, batch_size=32, shuffle=False)
     
     checkpoint_path = "model.pkl"
     config = TimeRCDConfig()
     config.ts_config.num_features = 1
     config.ts_config.d_model = 512
-    config.ts_config.patch_size = 16
+    config.ts_config.patch_size = 21
     model = TimeSeriesPretrainModel(config).to(device)
     
     if os.path.exists(checkpoint_path):
@@ -486,11 +498,13 @@ def ingestion_predict(args):
                 future_preds_norm = reconstructed[i][future_mask]
                 label = 1 if (future_preds_norm > -1.0).any() else 0
                 results.append({'id': ids[i].item(), 'label': label})
-                print(f"id: {ids[i].item()}, label: {label}")
+                # print(f"id: {ids[i].item()}, label: {label}")
 
     df_res = pd.DataFrame(results)
     df_res.to_csv(args.predictions_out, index=False)
     print(f"Predictions saved to {args.predictions_out}")
+    if not df_res.empty:
+        print(f"Predicted anomaly percentage: {df_res['label'].mean() * 100:.2f}%")
 
 
 if __name__ == "__main__":

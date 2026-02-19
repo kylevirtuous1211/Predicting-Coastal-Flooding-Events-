@@ -95,14 +95,16 @@ class FloodDatasetStatic(Dataset):
 
 
 class FloodDataset(Dataset):
-    def __init__(self, data_path, split='train', context_len=168, pred_len=336):
+    def __init__(self, data_path, split='train', context_len=168, pred_len=336, augment=False):
         """
         Args:
             data_path: Path to foundation_data.pkl
             split: 'train' or 'test'
             context_len: Length of history window (Input)
             pred_len: Length of prediction window (Target)
+            augment: Boolean, whether to apply data augmentation (scaling, jitter)
         """
+        self.augment = augment
         with open(data_path, 'rb') as f:
             data = pickle.load(f)
             
@@ -131,12 +133,21 @@ class FloodDataset(Dataset):
         Y = item['Y'][local_idx]
         
         # Dynamic slicing: take the LAST context_len hours from X
-        # This allows a 720h dataset to serve 168h, 336h, or 720h experiments
         if len(X) > self.context_len:
             X = X[-self.context_len:]
         
-        # Concatenate to form the full sequence for TimeRCD
         full_seq = np.concatenate([X, Y])
+        
+        # Apply Data Augmentation (only if enabled)
+        if self.augment:
+            # 1. Random Scaling (0.9 to 1.1)
+            scale = np.random.uniform(0.9, 1.1)
+            full_seq = full_seq * scale
+            
+            # 2. Jitter (Gaussian noise, sigma=0.01)
+            noise = np.random.normal(0, 0.01, size=full_seq.shape)
+            full_seq = full_seq + noise
+            
         full_seq = torch.FloatTensor(full_seq).unsqueeze(-1)  # (context_len + pred_len, 1)
         
         # Mask for Reconstruction Task
