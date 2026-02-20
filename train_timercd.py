@@ -20,11 +20,11 @@ from models.time_rcd.time_rcd_config import TimeRCDConfig
 
 # Configuration
 DATA_FILE = "foundation_data_deep_105d.pkl"
-CHECKPOINT_DIR = "checkpoints/timercd_finetune"
+CHECKPOINT_DIR = "checkpoints/timercd_finetune/75days"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 BATCH_SIZE = 64 # Reduced from 256 for longer context
-EPOCHS = 40     # Increased from 20
+EPOCHS = 60     # Increased from 20
 LEARNING_RATE = 1e-4
 CONTEXT_LEN = 1800
 PATCH_SIZE = 21
@@ -56,10 +56,8 @@ def weighted_reconstruction_loss(embeddings, targets, mask, model, flood_weight=
 
     return final_loss
 
-    return final_loss
-
 def train(resume_checkpoint=None, epochs=EPOCHS):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     # Load Dataset
@@ -205,20 +203,37 @@ def train(resume_checkpoint=None, epochs=EPOCHS):
         model.train()
         
         # Plotting code follows (omitted for brevity, can remain as is if not in replacement chunk)
-        plt.figure(figsize=(10, 5))
-        plt.plot(range(start_epoch + 1, epoch + 2), train_losses, label='Training Loss')
-        plt.savefig("training_plots/loss.png")
-        plt.close()
-
-        plt.figure(figsize=(10, 5))
-        plt.plot(range(1, epoch+2), val_mccs, label='MCC')
-        plt.plot(range(1, epoch+2), val_f1s, label='F1 Score')
+        # Side-by-side Plotting to match TimeRCD_prior
+        plt.figure(figsize=(12, 4))
+        
+        from datetime import datetime
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        title_str = f"TimeRCD (P={PATCH_SIZE}, W={FLOOD_WEIGHT}, C={CONTEXT_LEN}h)\n{date_str}"
+        
+        plt.subplot(1, 2, 1)
+        # Handle resume case for x-axis
+        x_range_train = range(start_epoch + 1, epoch + 2)
+        # Note: train_losses is appended every epoch, but if we resume, we only have new losses.
+        # Plotting against correct epoch numbers.
+        plt.plot(x_range_train, train_losses, label='Train Loss')
         plt.xlabel('Epoch')
-        plt.ylabel('Score')
-        plt.title('Validation Metrics Over Time')
+        plt.ylabel('Loss')
+        plt.title(f'Training Loss\n{title_str}', fontsize=10)
         plt.legend()
         plt.grid(True)
-        plt.savefig("training_plots/metrics.png")
+        
+        plt.subplot(1, 2, 2)
+        x_range_val = range(start_epoch + 1, epoch + 2)
+        plt.plot(x_range_val, val_mccs, label='Val MCC')
+        plt.plot(x_range_val, val_f1s, label='Val F1')
+        plt.xlabel('Epoch')
+        plt.ylabel('Score')
+        plt.title(f'Validation Metrics\n{title_str}', fontsize=10)
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig("training_plots/timercd_finetune_training.png")
         plt.close()
         
     print("Training Complete.")

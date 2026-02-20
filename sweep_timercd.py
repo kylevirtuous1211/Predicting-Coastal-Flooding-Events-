@@ -11,13 +11,19 @@ import matplotlib.pyplot as plt
 import pandas as pd # Ensure pandas is available
 
 # Import directly from model_timercd.py
+print("Inside sweep_timercd.py...")
 # Assuming model_timercd.py is in the current directory or python path
 sys.path.append(os.getcwd())
-from model_timercd import TimeSeriesPretrainModel, TimeRCDConfig
+try:
+    from model_timercd import TimeSeriesPretrainModel, TimeRCDConfig
+    print("Successfully imported model_timercd")
+except Exception as e:
+    print(f"Failed to import model_timercd: {e}")
+    sys.exit(1)
 
 # Configuration Defaults (can be overridden)
 DEFAULT_DATA_FILE = "foundation_data_deep_105d.pkl" 
-DEFAULT_CHECKPOINT = "checkpoints/timercd_finetune/timercd_epoch_40.pth"
+DEFAULT_CHECKPOINT = "checkpoints/timercd_finetune/75days/timercd_epoch_60.pth"
 CONTEXT_LEN = 1800
 PATCH_SIZE = 21
 BATCH_SIZE = 32
@@ -236,9 +242,18 @@ def sweep(data_file, checkpoint_path):
     print("Saved plot to sweep_timercd.png")
 
 if __name__ == "__main__":
+    print("Parsing arguments...")
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default=DEFAULT_DATA_FILE)
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--context_len", type=int, default=CONTEXT_LEN)
+    parser.add_argument("--patch_size", type=int, default=PATCH_SIZE)
     args = parser.parse_args()
     
+    # Update globals
+    print(f"Arguments parsed: {args}")
+    CONTEXT_LEN = args.context_len
+    PATCH_SIZE = args.patch_size
+    
+    print("Starting sweep...")
     sweep(args.data, args.checkpoint)

@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 class TimeSeriesConfig:
     d_model: int = 512
     d_proj: int = 256
-    patch_size: int = 4
+    patch_size: int = 21
     num_query_tokens: int = 1
     num_layers: int = 8
     num_heads: int = 8
@@ -496,7 +496,7 @@ def ingestion_predict(args):
             for i in range(len(ids)):
                 future_mask = mask[i].bool()
                 future_preds_norm = reconstructed[i][future_mask]
-                label = 1 if (future_preds_norm > -1.0).any() else 0
+                label = 1 if (future_preds_norm > -0.10).any() else 0
                 results.append({'id': ids[i].item(), 'label': label})
                 # print(f"id: {ids[i].item()}, label: {label}")
 

@@ -12,7 +12,7 @@ cp README.md submission_timercd/
 cp station_metadata.pkl submission_timercd/
 
 # Copy Checkpoints
-cp checkpoints/timercd_finetune/timercd_epoch_40.pth submission_timercd/model.pkl
+cp checkpoints/timercd_finetune/75days/timercd_epoch_60.pth submission_timercd/model.pkl
 
 # Zip
 cd submission_timercd
