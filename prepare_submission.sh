@@ -1,32 +1,22 @@
 #!/bin/bash
 
-# Prep Directories
-mkdir -p init_submission
-mkdir -p init_submission/zeroshot
-mkdir -p init_submission/finetuned
+# Prep Directory
+mkdir -p submission_timercd
+rm -rf submission_timercd/*
+rm -f submission_timercd.zip
 
-# Common Files
-cp model.py init_submission/zeroshot/
-cp requirements.txt init_submission/zeroshot/Requirements.txt
-cp README.md init_submission/zeroshot/
-cp station_metadata.pkl init_submission/zeroshot/
+# Copy Files
+cp model_timercd.py submission_timercd/model.py
+cp requirements.txt submission_timercd/Requirements.txt
+cp README.md submission_timercd/
+cp station_metadata.pkl submission_timercd/
 
-cp model.py init_submission/finetuned/
-cp requirements.txt init_submission/finetuned/Requirements.txt
-cp README.md init_submission/finetuned/
-cp station_metadata.pkl init_submission/finetuned/
-
-# Zero-Shot Model
-cp Time-RCD/checkpoints/full_mask_anomaly_head_pretrain_checkpoint_best.pth init_submission/zeroshot/model.pkl
-
-# Finetuned Model
-cp checkpoints/timercd_finetune/timercd_epoch_1.pth init_submission/finetuned/model.pkl
+# Copy Checkpoints
+cp checkpoints/timercd_finetune/75days/timercd_epoch_60.pth submission_timercd/model.pkl
 
 # Zip
-rm -f zeroshot.zip finetuned.zip
-cd init_submission/zeroshot
-zip -r ../../zeroshot.zip .
-cd ../finetuned
-zip -r ../../finetuned.zip .
+cd submission_timercd
+zip -r ../submission_timercd.zip .
+cd ..
 
-echo "Submission files created: zeroshot.zip and finetuned.zip"
+echo "Submission file created: submission_timercd.zip"

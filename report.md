@@ -1,48 +1,100 @@
-# Model Architecture & Data Analysis Report
+# Testing files structure
+## test_hourly.csv - Station Data
+time	station_name	sea_level
+2020-01-01 00:00	Boston	1.234
+2020-01-01 01:00	Boston	1.245
 
-## 1. Dataset Analysis
+## test_index.csv - Hidden Dates
+id	station_name	hist_start
+0	Boston	2021-06-15 00:00
+1	Boston	2021-06-16 00:00
 
-Based on the preprocessing of `NEUSTG_19502020_12stations.mat`, we have established the following data scale:
 
-*   **Training Samples:** 226,134 sequences
-*   **Validation Samples:** 74,277 sequences
-*   **Input Feature Space:** 28 Dimensions
-    *   Derived from 7-day historical window
-    *   4 features per day (Mean, Max, Min, Std of Standardized Distance)
-*   **Target Output Space:** 14 Dimensions
-    *   Binary classification (Flood/No-Flood) for the next 14 days
+## Prior token architecture 
 
-### Token/Data Point Calculation
-Total Input Data Points = Samples $\times$ Features
-$$ 226,134 \times 28 \approx 6.33 \text{ Million Data Points} $$
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           TRAINING PHASE 1                              │
+│   ┌─────────────┐                                                       │
+│   │  History    │──► FloodScout ──► Probability ──► BCE/Focal Loss      │
+│   │  (168 hrs)  │         ▲                              ▲              │
+│   └─────────────┘         │                              │              │
+│                      Train Supervised              Ground Truth         │
+│                                                    (did future flood?)  │
+└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           TRAINING PHASE 2                              │
+│   ┌─────────────┐                                                       │
+│   │  History    │──► FloodScout (FROZEN) ──► Prob                       │
+│   │  (168 hrs)  │                              │                        │
+│   └──────┬──────┘                              ▼                        │
+│          │                         ┌───────────────────┐                │
+│          │                         │ PriorEmbedding    │                │
+│          │                         │ safe_token ◄──────┤                │
+│          │                         │ risk_token ◄──────┤                │
+│          │                         └────────┬──────────┘                │
+│          │                                  │                           │
+│          ▼                                  ▼                           │
+│   ┌──────────────────────────────────────────────────┐                  │
+│   │  [Prior_Token] + [Patch_1] + [Patch_2] + ...     │                  │
+│   └──────────────────────────────────────────────────┘                  │
+│                              │                                          │
+│                              ▼                                          │
+│                        TimeRCD Transformer                              │
+│                              │                                          │
+│                              ▼                                          │
+│                    Reconstruction Loss (MSE)                            │
+└─────────────────────────────────────────────────────────────────────────┘
 
-## 2. Model Selection Strategy
+## Best configuration:
+context length: 1800h (30 days)
+loss weight: 8
+patch size: 21
 
-### Assessment
-The dataset is classified as **Medium-Sized Tabular**.
-*   It is structured (dense numerical features), not unstructured (text/image).
-*   The relationship between "Distance to Threshold" and "Flood Probability" is likely monotonic but non-linear.
+## Upload checks
+[1. Make sure the checkpoint can be loaded
+2. Make sure the model has these hyperparameters:
+* context length: 1800h (30 days)
+* loss weight: 8
+* patch size: 21
 
-### Candidate Architectures
-| Architecture | Suitability | Reasoning |
-| :--- | :--- | :--- |
-| **Transformer (LLM/BERT)** | Low | Overkill. 6M data points is insufficient to train large attention heads from scratch without massive overfitting. The input sequence length (7) is too short to benefit from attention mechanisms. |
-| **Deep ResNet / CNN** | Low | Numerical features lack the spatial correlation (pixels) that CNNs exploit. |
-| **LSTM / RNN** | Medium | Good for time-series, but can be slow to train and harder to tune for simple tabular dependencies. |
-| **XGBoost (GBT)** | **High** | **Chosen.** Gradient Boosted Trees are the State-of-the-Art (SOTA) for tabular data up to ~10M rows. They handle non-linear decision boundaries efficiently and require less hyperparameter tuning than Neural Networks. |
+3. Make sure OOD stations can be inferenced via the threshold formula
+4. Trace all the scripts to be without logical bugs
+]
+## test context lengths:
 
-## 3. Selected Approach: Global XGBoost
+============================================================
+Context (h)  Days     Best MCC     Best Epoch   Final MCC   
+--------------------------------------------------------
+168          7        0.2735       15           0.2643      
+336          14       0.3112       19           0.3065      
+720          30       0.3359       19           0.3303      
 
-We will implement a **Multi-Output XGBoost Regressor**.
+✅ BEST CONTEXT LENGTH: 720h (30 days)
+   MCC=0.3359 at epoch 19
 
-*   **Input:** 28 standardized features (normalized by station variance and threshold).
-*   **Output:** 14 binary probabilities (one for each forecast day).
-*   **Training Strategy:**
-    *   Train a single "Global" model on all 9 training stations combined.
-    *   This forces the model to learn the universal physics of "Distance to Threshold" rather than memorizing specific station behavior.
-    *   This directly addresses the **Out-of-Distribution (OOD)** challenge.
 
-### Expected Size
-*   **Trees:** ~100-500 trees
-*   **Depth:** 4-6 (to prevent overfitting)
-*   **Inference Speed:** < 10ms per batch (extremely fast)
+## The forecasting good:
+
+It is indeed impressive! What you are seeing is the power of a Foundation Model for Time Series.
+
+There are four main reasons why the model generalizes so well to a "hidden" station like Lewes:
+
+1. The "Language" of Tides is Universal
+Coastal sea levels share the same underlying physics (gravitational pull of the moon and sun). These create periodic oscillations known as tides. Even though the model wasn't trained on Lewes, it was trained on 9 other coastal stations. It has learned the "syntax" of semi-diurnal and diurnal tides. Once it sees the recent phase and amplitude in your 75-day window, it can "track" that rhythm into the future.
+
+2. The Benefit of 1800-Hour (75-Day) Context
+By giving the model 1800 hours of history, we are giving it a huge advantage.
+
+Tidal Memory: It sees about 150 full tidal cycles. This allows the self-attention mechanism to perfectly align with the local frequency.
+Trend Capture: If there is a large-scale meteorological trend (like an approaching storm surge or a seasonal rise), 75 days is long enough for the Transformer to see the "slope" of that trend and project it forward.
+3. Effective Normalization
+Notice that we normalize the data using: 
+(Value - Threshold) / Std
+. This process effectively "strips away" the unique geography of Lewes. To the model, it doesn't see "Lewes, Delaware"; it just sees a normalized signal fluctuating around zero. Because all stations are normalized to the same scale, the model's weights (learned from other stations) are directly applicable.
+
+4. Large-Scale Pre-training
+The Timer architecture (which TimeRCD is based on) was pre-trained on the UTSD (Universal Time Series Dataset), which contains one billion time points from many different domains (weather, electricity, traffic, etc.). This gives the model a strong "prior" on how time series generally behave—how they trend, how they cycle, and how they revert to the mean.
+
+In Figure 12 (your upload): You can see that even when the ground truth (dotted black) has a slightly higher peak than the history, the model (red) correctly predicts that the peaks will stay high or increase. It has "learned" that if the energy in the system is increasing, the next 14 days will likely maintain that momentum.
+
+It's a great sign for the Final Phase—it suggests the model is robust enough to handle the 4 hidden stations!
