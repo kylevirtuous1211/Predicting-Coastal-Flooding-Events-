@@ -15,44 +15,55 @@ pip install -r requirements.txt
 ```
 
 ## Key Files
-- `model.py`: The core script for the challenge submission. Contains the model architecture, inference logic, and evaluation loop.
-- `train_timercd.py`: Designated script for training the TimeRCD model from scratch or finetuning.
-- `preprocess_foundation.py`: Script to prepare and normalize data from raw sources into `foundation_data.pkl`.
-- `timercd_utils.py`: Utility functions and Dataset classes shared across training scripts.
-- `extract_metadata.py`: Helper to extract station statistics (mean, std, thresholds) for normalization.
+- `model_timercd.py`: Core model script for the challenge. Contains architecture and ingestion logic.
+- `train_timercd.py`: Main script for finetuning TimeRCD on coastal flooding data.
+- `preprocess_foundation_deep.py`: Generates the deep context dataset (`foundation_data_deep_105d.pkl`).
+- `sweep_timercd.py`: Performs a threshold sweep on checkpoints to optimize for MCC.
+- `visualize_predictions.py`: Generates plots for the 15 official seed intervals.
 
-## Usage
+## Reproduction Steps
 
-### 1. Data Preprocessing
-If starting from raw data:
+### 1. Data Generation
+Generate the 105-day context dataset (75 days history + 14 days forecasting window + 16 days padding/slack):
 ```bash
-python preprocess_foundation.py
+python preprocess_foundation_deep.py --hist_days 105
 ```
-This generates `foundation_data.pkl` containing training and testing splits.
+This produces `foundation_data_deep_105d.pkl`.
 
-### 2. Training
-To train the model:
+### 2. Fine-tuning
+Ensure the hyperparameters in `train_timercd.py` match the best configuration:
+*   `CONTEXT_LEN = 1800` (75 days)
+*   `PATCH_SIZE = 21`
+*   `FLOOD_WEIGHT = 8.0`
+
+Run the training script:
 ```bash
 python train_timercd.py
 ```
-Checkpoints will be saved to `checkpoints/timercd_finetune/`.
+Checkpoints are saved in `checkpoints/timercd_finetune/75days/`.
 
-### 3. Evaluation & Submission
-To run the model in evaluation mode (as used by the competition platform):
+### 3. Threshold Optimization
+Run a sweep on the best checkpoint (e.g., epoch 60) to find the optimal decision boundary:
 ```bash
-python model.py --mode evaluate --data foundation_data.pkl --model model.pkl
+python sweep_timercd.py --checkpoint checkpoints/timercd_finetune/75days/timercd_epoch_60.pth
+```
+**Best Result**: MCC ≈ 0.6289 at Threshold = **-0.10**.
+
+### 4. Visualization & Verification
+Generate plots for the official seed intervals to verify phase alignment and reconstruction quality:
+```bash
+# Update CHECKPOINT in visualize_predictions.py if necessary
+python visualize_predictions.py
 ```
 
-For submission capability, `model.py` is self-contained. It loads `model.pkl` (weights) and `station_metadata.pkl` (normalization stats).
+## Configuration & Architecture
+The model is optimized for **long-term tidal memory** and **imbalanced flood events**.
 
-## Model Architecture details
-- **Backbone**: TimeRCD (Time-Series Rotary-position-embedding Cross-domain)
-- **Input Dimensions**: 168 time steps (7 days) x 1 feature (Sea Level)
-- **Output**: 336 time steps (14 days) reconstruction
-- **Flood Detection**:
-  - The model outputs normalized sea level predictions.
-  - Flooding is predicted if any hourly value in the future window exceeds the station's flood threshold (normalized to 0.0).
+- **Context Length**: 1800 hours (75 days). High-resolution context allows the Transformer to align with local station tidal phases.
+- **Patch Size**: 21 hours. Optimized for sea-level frequency.
+- **Loss Weighting**: 8.0x penalty for flood events (Values > Threshold).
+- **Thresholding**: Data is normalized as `(Value - Threshold) / Std`, meaning a prediction > 0 theoretically signifies a flood. The optimal threshold found via sweep is **-0.10**.
 
-## Results
-- **Metric**: Matthews Correlation Coefficient (MCC) & F1 Score.
-- **Current Performance**: Zero-shot MCC ~0.89.
+## Performance
+- **Zero-shot (Pretrained)**: MCC ~0.33
+- **Fine-tuned (75d context)**: **MCC 0.6289**, **F1 0.6655** (at Epoch 60).
